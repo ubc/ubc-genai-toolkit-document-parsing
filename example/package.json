@@ -1,0 +1,24 @@
+{
+  "name": "ubc-genai-toolkit-document-parsing-example",
+  "version": "0.1.0",
+  "description": "Example CLI app for the ubc-genai-toolkit-document-parsing package.",
+  "private": true,
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -b",
+    "start": "node dist/index.js",
+    "clean": "rm -rf dist tsconfig.tsbuildinfo"
+  },
+  "dependencies": {
+    "ubc-genai-toolkit-core": "^0.1.0",
+    "ubc-genai-toolkit-document-parsing": "file:..",
+    "dotenv": "^16.4.5",
+    "readline-sync": "^1.4.10"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.12",
+    "@types/readline-sync": "^1.4.8",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.2"
+  }
+}
