@@ -12,6 +12,7 @@ import {
 	SupportedOutputFormat,
 	SupportedInputMimeType,
 	SupportedInputExtension,
+	EmbeddedImage,
 } from './types';
 import { UnsupportedFileTypeError, ParsingError } from './error';
 import * as path from 'path';
@@ -22,6 +23,23 @@ import pdf2md from '@opendocsg/pdf2md';
 import mammoth from 'mammoth';
 import TurndownService from 'turndown';
 import markdownToText from 'markdown-to-text';
+import JSZip from 'jszip';
+
+const PPTX_MIME_TYPE =
+	'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+
+/** Maps common image file extensions found in PPTX archives to MIME types. */
+const IMAGE_EXTENSION_MIME_TYPES: Record<string, string> = {
+	'.png': 'image/png',
+	'.jpg': 'image/jpeg',
+	'.jpeg': 'image/jpeg',
+	'.gif': 'image/gif',
+	'.bmp': 'image/bmp',
+	'.tif': 'image/tiff',
+	'.tiff': 'image/tiff',
+	'.webp': 'image/webp',
+	'.svg': 'image/svg+xml',
+};
 
 // Define default configuration if any specific defaults are needed for this module
 const DEFAULT_DOC_PARSING_CONFIG: Partial<DocumentParsingConfig> = {
@@ -114,6 +132,9 @@ export class DocumentParsingModule {
 				case 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
 					content = await this._parseDocx(filePath, outputFormat);
 					break;
+				case PPTX_MIME_TYPE:
+					content = await this._parsePptx(filePath, outputFormat);
+					break;
 				case 'text/html':
 					content = await this._parseHtml(filePath, outputFormat);
 					break;
@@ -181,6 +202,7 @@ export class DocumentParsingModule {
 				switch (mimeType) {
 					case 'application/pdf':
 					case 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+					case PPTX_MIME_TYPE:
 					case 'text/html':
 					case 'text/markdown':
 						return mimeType as SupportedInputMimeType;
@@ -204,6 +226,8 @@ export class DocumentParsingModule {
 				return 'application/pdf';
 			case '.docx':
 				return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+			case '.pptx':
+				return PPTX_MIME_TYPE;
 			case '.html':
 			case '.htm':
 				return 'text/html';
@@ -263,6 +287,373 @@ export class DocumentParsingModule {
 			this.logger.error('DOCX parsing failed', { filePath, error });
 			throw new ParsingError('Failed to parse DOCX file', filePath, error);
 		}
+	}
+
+	/**
+	 * Parses PPTX (PowerPoint) content using a pure-JS approach (no system
+	 * dependencies). Reads slide text and speaker notes directly from the OOXML
+	 * archive and, when an {@link ImageDescriber} is configured, inlines textual
+	 * descriptions of embedded images (charts, screenshots, pictures).
+	 */
+	private async _parsePptx(
+		filePath: string,
+		outputFormat: SupportedOutputFormat
+	): Promise<string> {
+		this.logger.debug('Parsing PPTX', { filePath, outputFormat });
+		try {
+			const buffer = await fs.readFile(filePath);
+			const zip = await JSZip.loadAsync(buffer);
+
+			const slidePaths = await this._getOrderedSlidePaths(zip);
+			if (slidePaths.length === 0) {
+				this.logger.warn('No slides found in PPTX', { filePath });
+			}
+
+			const describer = this.config.imageDescriber;
+			let describedImageCount = 0;
+			const slideBlocks: string[] = [];
+
+			for (let i = 0; i < slidePaths.length; i++) {
+				const slideNumber = i + 1;
+				const slidePath = slidePaths[i];
+				const slideXml = await zip.file(slidePath)?.async('string');
+				if (!slideXml) {
+					continue;
+				}
+
+				const parts: string[] = [`## Slide ${slideNumber}`];
+
+				const slideText = this._extractTextFromSlideXml(slideXml);
+				if (slideText.trim()) {
+					parts.push(slideText.trim());
+				}
+
+				// Describe embedded images, but only if a describer was supplied.
+				if (describer) {
+					const images = await this._extractSlideImages(
+						zip,
+						slidePath,
+						slideXml,
+						slideNumber
+					);
+					for (const image of images) {
+						const description = await this._describeImageSafely(
+							describer,
+							image
+						);
+						if (description && description.trim()) {
+							describedImageCount++;
+							parts.push(`> [Image] ${description.trim()}`);
+						}
+					}
+				}
+
+				// Speaker notes, if present.
+				const notes = await this._extractSlideNotes(zip, slidePath);
+				if (notes.trim()) {
+					parts.push(`### Notes\n\n${notes.trim()}`);
+				}
+
+				slideBlocks.push(parts.join('\n\n'));
+			}
+
+			if (describer) {
+				this.logger.debug('PPTX image description complete', {
+					filePath,
+					describedImageCount,
+				});
+			}
+
+			const markdownContent = slideBlocks.join('\n\n');
+
+			if (outputFormat === 'markdown') {
+				return markdownContent;
+			} else {
+				return markdownToText(markdownContent);
+			}
+		} catch (error) {
+			if (error instanceof ToolkitError) {
+				throw error;
+			}
+			this.logger.error('PPTX parsing failed', { filePath, error });
+			throw new ParsingError('Failed to parse PPTX file', filePath, error);
+		}
+	}
+
+	/**
+	 * Determines slide files in presentation (display) order. Uses the
+	 * presentation relationships when available, falling back to a numeric sort
+	 * of the slide files if the ordering metadata is missing or malformed.
+	 */
+	private async _getOrderedSlidePaths(zip: JSZip): Promise<string[]> {
+		const numericSortFallback = (): string[] =>
+			Object.keys(zip.files)
+				.filter((name) => /^ppt\/slides\/slide\d+\.xml$/.test(name))
+				.sort((a, b) => this._slideFileNumber(a) - this._slideFileNumber(b));
+
+		try {
+			const presentationXml = await zip
+				.file('ppt/presentation.xml')
+				?.async('string');
+			const relsXml = await zip
+				.file('ppt/_rels/presentation.xml.rels')
+				?.async('string');
+
+			if (!presentationXml || !relsXml) {
+				return numericSortFallback();
+			}
+
+			// Map relationship id -> slide path (targets are relative to ppt/).
+			const rels = this._parseRelationships(relsXml);
+			const relIdToPath = new Map<string, string>();
+			for (const rel of rels) {
+				if (rel.type.endsWith('/slide')) {
+					relIdToPath.set(rel.id, this._resolveZipPath('ppt', rel.target));
+				}
+			}
+
+			// Read the ordered list of slide relationship ids from the deck.
+			const orderedPaths: string[] = [];
+			const sldIdRegex = /<p:sldId\b[^>]*\br:id="([^"]+)"/g;
+			let match: RegExpExecArray | null;
+			while ((match = sldIdRegex.exec(presentationXml)) !== null) {
+				const slidePath = relIdToPath.get(match[1]);
+				if (slidePath && zip.file(slidePath)) {
+					orderedPaths.push(slidePath);
+				}
+			}
+
+			return orderedPaths.length > 0 ? orderedPaths : numericSortFallback();
+		} catch (error) {
+			this.logger.warn(
+				'Failed to read PPTX slide order; falling back to numeric sort',
+				{ error }
+			);
+			return numericSortFallback();
+		}
+	}
+
+	/** Extracts the trailing slide number from a slide file path. */
+	private _slideFileNumber(slidePath: string): number {
+		const match = slidePath.match(/slide(\d+)\.xml$/);
+		return match ? parseInt(match[1], 10) : 0;
+	}
+
+	/**
+	 * Extracts visible text from a slide's XML, preserving paragraph breaks.
+	 * Each `<a:p>` becomes a line; text runs (`<a:t>`) within it are concatenated.
+	 */
+	private _extractTextFromSlideXml(slideXml: string): string {
+		const paragraphs: string[] = [];
+		const paragraphRegex = /<a:p\b[^>]*>([\s\S]*?)<\/a:p>/g;
+		let pMatch: RegExpExecArray | null;
+		while ((pMatch = paragraphRegex.exec(slideXml)) !== null) {
+			const runs: string[] = [];
+			const runRegex = /<a:t>([\s\S]*?)<\/a:t>/g;
+			let rMatch: RegExpExecArray | null;
+			while ((rMatch = runRegex.exec(pMatch[1])) !== null) {
+				runs.push(this._decodeXmlEntities(rMatch[1]));
+			}
+			const line = runs.join('').trim();
+			if (line) {
+				paragraphs.push(line);
+			}
+		}
+		return paragraphs.join('\n');
+	}
+
+	/** Extracts speaker-notes text for a given slide, if a notes slide exists. */
+	private async _extractSlideNotes(
+		zip: JSZip,
+		slidePath: string
+	): Promise<string> {
+		const relsXml = await this._readSlideRels(zip, slidePath);
+		if (!relsXml) {
+			return '';
+		}
+		const baseDir = slidePath.substring(0, slidePath.lastIndexOf('/'));
+		const notesRel = this._parseRelationships(relsXml).find((rel) =>
+			rel.type.endsWith('/notesSlide')
+		);
+		if (!notesRel) {
+			return '';
+		}
+		const notesPath = this._resolveZipPath(baseDir, notesRel.target);
+		const notesXml = await zip.file(notesPath)?.async('string');
+		return notesXml ? this._extractTextFromSlideXml(notesXml) : '';
+	}
+
+	/**
+	 * Collects embedded raster images placed on a slide, in their on-slide
+	 * order (via `<a:blip r:embed>` references), de-duplicated by relationship.
+	 */
+	private async _extractSlideImages(
+		zip: JSZip,
+		slidePath: string,
+		slideXml: string,
+		slideNumber: number
+	): Promise<EmbeddedImage[]> {
+		const relsXml = await this._readSlideRels(zip, slidePath);
+		if (!relsXml) {
+			return [];
+		}
+		const baseDir = slidePath.substring(0, slidePath.lastIndexOf('/'));
+		const relIdToTarget = new Map<string, string>();
+		for (const rel of this._parseRelationships(relsXml)) {
+			if (rel.type.endsWith('/image')) {
+				relIdToTarget.set(rel.id, rel.target);
+			}
+		}
+		if (relIdToTarget.size === 0) {
+			return [];
+		}
+
+		// Preserve on-slide order via blip embeds; ignore duplicate references.
+		const embedRegex = /r:embed="([^"]+)"/g;
+		const seen = new Set<string>();
+		const orderedRelIds: string[] = [];
+		let match: RegExpExecArray | null;
+		while ((match = embedRegex.exec(slideXml)) !== null) {
+			const relId = match[1];
+			if (relIdToTarget.has(relId) && !seen.has(relId)) {
+				seen.add(relId);
+				orderedRelIds.push(relId);
+			}
+		}
+
+		const images: EmbeddedImage[] = [];
+		for (const relId of orderedRelIds) {
+			const target = relIdToTarget.get(relId)!;
+			const mediaPath = this._resolveZipPath(baseDir, target);
+			const mimeType = this._imageMimeFromPath(mediaPath);
+			if (!this._isDescribableImage(mimeType)) {
+				continue; // Skip vector/unknown formats (e.g. EMF/WMF) vision models can't read.
+			}
+			const data = await zip.file(mediaPath)?.async('nodebuffer');
+			if (!data) {
+				continue;
+			}
+			images.push({
+				data,
+				mimeType,
+				slideNumber,
+				imageIndex: images.length,
+				fileName: mediaPath.substring(mediaPath.lastIndexOf('/') + 1),
+			});
+		}
+		return images;
+	}
+
+	/**
+	 * Invokes the consumer-supplied describer, isolating failures so a single
+	 * problematic image never aborts the overall parse.
+	 */
+	private async _describeImageSafely(
+		describer: NonNullable<DocumentParsingConfig['imageDescriber']>,
+		image: EmbeddedImage
+	): Promise<string | null | undefined> {
+		try {
+			return await describer(image);
+		} catch (error) {
+			this.logger.warn('imageDescriber failed for embedded image; skipping', {
+				slideNumber: image.slideNumber,
+				fileName: image.fileName,
+				error,
+			});
+			return undefined;
+		}
+	}
+
+	/** Reads the `.rels` file associated with a slide, if present. */
+	private async _readSlideRels(
+		zip: JSZip,
+		slidePath: string
+	): Promise<string | undefined> {
+		const dir = slidePath.substring(0, slidePath.lastIndexOf('/'));
+		const file = slidePath.substring(slidePath.lastIndexOf('/') + 1);
+		return zip.file(`${dir}/_rels/${file}.rels`)?.async('string');
+	}
+
+	/** Parses OOXML relationship entries into {id, type, target} records. */
+	private _parseRelationships(
+		relsXml: string
+	): Array<{ id: string; type: string; target: string }> {
+		const rels: Array<{ id: string; type: string; target: string }> = [];
+		const relRegex = /<Relationship\b[^>]*\/?>/g;
+		let match: RegExpExecArray | null;
+		while ((match = relRegex.exec(relsXml)) !== null) {
+			const tag = match[0];
+			const id = this._attr(tag, 'Id');
+			const type = this._attr(tag, 'Type');
+			const target = this._attr(tag, 'Target');
+			if (id && type && target) {
+				rels.push({ id, type, target });
+			}
+		}
+		return rels;
+	}
+
+	/** Reads a single double-quoted attribute value from an XML tag string. */
+	private _attr(tag: string, name: string): string | undefined {
+		const match = tag.match(new RegExp(`\\b${name}="([^"]*)"`));
+		return match ? match[1] : undefined;
+	}
+
+	/**
+	 * Resolves an OOXML relationship target (which may be relative, e.g.
+	 * `../media/image1.png`) against a base directory into a normalized zip path.
+	 */
+	private _resolveZipPath(baseDir: string, target: string): string {
+		if (target.startsWith('/')) {
+			return target.replace(/^\/+/, '');
+		}
+		const segments = baseDir ? baseDir.split('/') : [];
+		for (const part of target.split('/')) {
+			if (part === '' || part === '.') {
+				continue;
+			}
+			if (part === '..') {
+				segments.pop();
+			} else {
+				segments.push(part);
+			}
+		}
+		return segments.join('/');
+	}
+
+	/** Infers an image MIME type from a media file's extension. */
+	private _imageMimeFromPath(mediaPath: string): string {
+		const ext = path.extname(mediaPath).toLowerCase();
+		return IMAGE_EXTENSION_MIME_TYPES[ext] || 'application/octet-stream';
+	}
+
+	/** Whether a MIME type is a raster image a vision model can typically read. */
+	private _isDescribableImage(mimeType: string): boolean {
+		switch (mimeType) {
+			case 'image/png':
+			case 'image/jpeg':
+			case 'image/gif':
+			case 'image/bmp':
+			case 'image/webp':
+			case 'image/tiff':
+				return true;
+			default:
+				return false;
+		}
+	}
+
+	/** Decodes the small set of XML entities that appear in OOXML text runs. */
+	private _decodeXmlEntities(text: string): string {
+		return text
+			.replace(/&lt;/g, '<')
+			.replace(/&gt;/g, '>')
+			.replace(/&quot;/g, '"')
+			.replace(/&apos;/g, "'")
+			.replace(/&#x([0-9a-fA-F]+);/g, (_, hex) =>
+				String.fromCodePoint(parseInt(hex, 16))
+			)
+			.replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(parseInt(dec, 10)))
+			.replace(/&amp;/g, '&');
 	}
 
 	/** Parses HTML content. */

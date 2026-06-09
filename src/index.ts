@@ -11,6 +11,8 @@ export {
 	SupportedInputMimeType,
 	SupportedInputExtension,
 	SupportedOutputFormat,
+	EmbeddedImage,
+	ImageDescriber,
 } from './types';
 
 // Export custom error types
