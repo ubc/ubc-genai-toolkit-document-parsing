@@ -310,6 +310,7 @@ export class DocumentParsingModule {
 			}
 
 			const describer = this.config.imageDescriber;
+			const onSlide = this.config.onSlide;
 			let describedImageCount = 0;
 			const slideBlocks: string[] = [];
 
@@ -322,6 +323,7 @@ export class DocumentParsingModule {
 				}
 
 				const parts: string[] = [`## Slide ${slideNumber}`];
+				let slideDescribedCount = 0;
 
 				const slideText = this._extractTextFromSlideXml(slideXml);
 				if (slideText.trim()) {
@@ -342,7 +344,7 @@ export class DocumentParsingModule {
 							image
 						);
 						if (description && description.trim()) {
-							describedImageCount++;
+							slideDescribedCount++;
 							parts.push(`> [Image] ${description.trim()}`);
 						}
 					}
@@ -354,7 +356,19 @@ export class DocumentParsingModule {
 					parts.push(`### Notes\n\n${notes.trim()}`);
 				}
 
-				slideBlocks.push(parts.join('\n\n'));
+				describedImageCount += slideDescribedCount;
+				const slideMarkdown = parts.join('\n\n');
+				slideBlocks.push(slideMarkdown);
+
+				// Deliver this slide for per-slide ("chunked") processing if requested.
+				if (onSlide) {
+					await onSlide({
+						slideNumber,
+						markdown: slideMarkdown,
+						text: markdownToText(slideMarkdown),
+						describedImageCount: slideDescribedCount,
+					});
+				}
 			}
 
 			if (describer) {

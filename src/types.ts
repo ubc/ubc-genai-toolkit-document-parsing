@@ -67,6 +67,39 @@ export type ImageDescriber = (
 ) => Promise<string | null | undefined>;
 
 /**
+ * A single fully-parsed slide, delivered incrementally via {@link SlideCallback}
+ * as PowerPoint parsing progresses. Lets a consumer process the deck one slide
+ * at a time — e.g. embed/store each slide as its own unit — instead of waiting
+ * for (and holding) the whole document at once.
+ */
+export interface ParsedSlide {
+  /** The 1-based slide number, in presentation order. */
+  slideNumber: number;
+
+  /**
+   * Markdown for this slide alone: its `## Slide N` heading, text, any inlined
+   * image descriptions, and speaker notes.
+   */
+  markdown: string;
+
+  /** Plain-text rendering of this slide alone (markdown flattened to text). */
+  text: string;
+
+  /** How many embedded images were described on this slide. */
+  describedImageCount: number;
+}
+
+/**
+ * Called once per slide as PowerPoint parsing completes it, in presentation
+ * order. Enables per-slide ("chunked") processing and storage rather than
+ * handling the whole file as one unit. If it returns a promise, parsing awaits
+ * it before continuing to the next slide.
+ *
+ * @param slide - The fully-parsed slide.
+ */
+export type SlideCallback = (slide: ParsedSlide) => void | Promise<void>;
+
+/**
  * Configuration for the DocumentParsingModule.
  * Extends the core ModuleConfig for common options like logger and debug.
  */
@@ -81,6 +114,15 @@ export interface DocumentParsingConfig extends ModuleConfig {
    * calls are made. See {@link ImageDescriber}.
    */
   imageDescriber?: ImageDescriber;
+
+  /**
+   * Optional callback invoked once per slide as a PowerPoint file is parsed
+   * (in presentation order). Enables per-slide processing/storage — e.g.
+   * embedding each slide independently — so large, image-heavy decks don't have
+   * to be handled as a single all-or-nothing unit. `parse()` still returns the
+   * full concatenated content as well. See {@link SlideCallback}.
+   */
+  onSlide?: SlideCallback;
 }
 
 /**

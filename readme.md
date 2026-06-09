@@ -122,6 +122,30 @@ Each image is passed as an `EmbeddedImage` (`{ data: Buffer, mimeType, slideNumb
 The hook is resilient: if it throws or returns an empty value for one image, that
 image is simply skipped and the rest of the parse continues.
 
+### Per-slide processing (`onSlide`)
+
+For large, image-heavy decks you may not want to handle the whole file as a
+single unit. Provide an `onSlide` callback and the module invokes it once per
+slide, in presentation order, as each slide finishes parsing — so you can embed
+or store each slide independently instead of waiting for (and holding) the entire
+document. `parse()` still returns the full concatenated content as well.
+
+```typescript
+const docParser = new DocumentParsingModule({
+	imageDescriber,
+	onSlide: async (slide) => {
+		// slide = { slideNumber, markdown, text, describedImageCount }
+		await indexSlide(slide.slideNumber, slide.text); // e.g. embed this slide alone
+	},
+});
+
+await docParser.parse({ filePath: 'lecture.pptx' }, 'markdown');
+```
+
+Each `ParsedSlide` carries that slide's `markdown` and plain `text` (heading +
+text + image descriptions + notes) plus `describedImageCount`. If the callback
+returns a promise, parsing awaits it before moving to the next slide.
+
 ## Error Handling
 
 The module uses the common error types from `ubc-genai-toolkit-core` and defines its own specific errors:
