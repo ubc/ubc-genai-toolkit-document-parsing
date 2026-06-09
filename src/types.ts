@@ -123,6 +123,15 @@ export interface DocumentParsingConfig extends ModuleConfig {
    * full concatenated content as well. See {@link SlideCallback}.
    */
   onSlide?: SlideCallback;
+
+  /**
+   * Maximum number of embedded images to describe concurrently (across all
+   * slides) when an {@link ImageDescriber} is configured. Higher values finish
+   * image-heavy decks much faster; keep it modest to respect provider rate
+   * limits. Defaults to 5. Slide output order is always preserved regardless of
+   * this value.
+   */
+  imageConcurrency?: number;
 }
 
 /**

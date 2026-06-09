@@ -311,9 +311,16 @@ export class DocumentParsingModule {
 
 			const describer = this.config.imageDescriber;
 			const onSlide = this.config.onSlide;
-			let describedImageCount = 0;
-			const slideBlocks: string[] = [];
 
+			// --- Phase 1: extract each slide's text, notes and embedded images. ---
+			interface SlideWork {
+				slideNumber: number;
+				slideText: string;
+				notes: string;
+				images: EmbeddedImage[];
+				descriptions: (string | undefined)[];
+			}
+			const slides: SlideWork[] = [];
 			for (let i = 0; i < slidePaths.length; i++) {
 				const slideNumber = i + 1;
 				const slidePath = slidePaths[i];
@@ -321,39 +328,56 @@ export class DocumentParsingModule {
 				if (!slideXml) {
 					continue;
 				}
+				const images = describer
+					? await this._extractSlideImages(zip, slidePath, slideXml, slideNumber)
+					: [];
+				slides.push({
+					slideNumber,
+					slideText: this._extractTextFromSlideXml(slideXml),
+					notes: await this._extractSlideNotes(zip, slidePath),
+					images,
+					descriptions: new Array(images.length),
+				});
+			}
 
-				const parts: string[] = [`## Slide ${slideNumber}`];
-				let slideDescribedCount = 0;
+			// --- Phase 2: describe all images concurrently (bounded), if enabled. ---
+			// Slow LLM calls run in parallel across the whole deck so image-heavy
+			// files don't take (sum of every call) time; output order is preserved.
+			if (describer) {
+				const tasks: Array<{ slide: SlideWork; index: number }> = [];
+				for (const slide of slides) {
+					slide.images.forEach((_image, index) => tasks.push({ slide, index }));
+				}
+				const concurrency = Math.max(1, this.config.imageConcurrency ?? 5);
+				await this._mapWithConcurrency(tasks, concurrency, async (task) => {
+					const description = await this._describeImageSafely(
+						describer,
+						task.slide.images[task.index]
+					);
+					task.slide.descriptions[task.index] =
+						description && description.trim() ? description.trim() : undefined;
+				});
+			}
 
-				const slideText = this._extractTextFromSlideXml(slideXml);
-				if (slideText.trim()) {
-					parts.push(slideText.trim());
+			// --- Phase 3: assemble each slide in order; deliver via onSlide. ---
+			let describedImageCount = 0;
+			const slideBlocks: string[] = [];
+			for (const slide of slides) {
+				const parts: string[] = [`## Slide ${slide.slideNumber}`];
+				if (slide.slideText.trim()) {
+					parts.push(slide.slideText.trim());
 				}
 
-				// Describe embedded images, but only if a describer was supplied.
-				if (describer) {
-					const images = await this._extractSlideImages(
-						zip,
-						slidePath,
-						slideXml,
-						slideNumber
-					);
-					for (const image of images) {
-						const description = await this._describeImageSafely(
-							describer,
-							image
-						);
-						if (description && description.trim()) {
-							slideDescribedCount++;
-							parts.push(`> [Image] ${description.trim()}`);
-						}
+				let slideDescribedCount = 0;
+				for (const description of slide.descriptions) {
+					if (description) {
+						slideDescribedCount++;
+						parts.push(`> [Image] ${description}`);
 					}
 				}
 
-				// Speaker notes, if present.
-				const notes = await this._extractSlideNotes(zip, slidePath);
-				if (notes.trim()) {
-					parts.push(`### Notes\n\n${notes.trim()}`);
+				if (slide.notes.trim()) {
+					parts.push(`### Notes\n\n${slide.notes.trim()}`);
 				}
 
 				describedImageCount += slideDescribedCount;
@@ -363,7 +387,7 @@ export class DocumentParsingModule {
 				// Deliver this slide for per-slide ("chunked") processing if requested.
 				if (onSlide) {
 					await onSlide({
-						slideNumber,
+						slideNumber: slide.slideNumber,
 						markdown: slideMarkdown,
 						text: markdownToText(slideMarkdown),
 						describedImageCount: slideDescribedCount,
@@ -451,6 +475,29 @@ export class DocumentParsingModule {
 	private _slideFileNumber(slidePath: string): number {
 		const match = slidePath.match(/slide(\d+)\.xml$/);
 		return match ? parseInt(match[1], 10) : 0;
+	}
+
+	/**
+	 * Runs `fn` over `items` with at most `limit` in flight at once. Used to
+	 * parallelize slow per-image describer calls while bounding concurrency.
+	 */
+	private async _mapWithConcurrency<T>(
+		items: T[],
+		limit: number,
+		fn: (item: T) => Promise<void>
+	): Promise<void> {
+		let next = 0;
+		const worker = async (): Promise<void> => {
+			while (next < items.length) {
+				const current = next++;
+				await fn(items[current]);
+			}
+		};
+		const workers = Array.from(
+			{ length: Math.min(Math.max(1, limit), items.length) },
+			() => worker()
+		);
+		await Promise.all(workers);
 	}
 
 	/**
