@@ -132,6 +132,20 @@ export interface DocumentParsingConfig extends ModuleConfig {
    * this value.
    */
   imageConcurrency?: number;
+
+  /**
+   * Treat an embedded image as a decorative/template element (and skip
+   * describing it) when the *same image* appears on at least this many distinct
+   * slides. Recurring icons, logos, dividers and doodles carry no instructional
+   * content, and describing them wastes describer calls and can trigger
+   * hallucinated descriptions on smaller vision models.
+   *
+   * Regardless of this value, identical images are always de-duplicated so each
+   * unique image is described at most once and the result reused.
+   *
+   * Defaults to 5. Set to 0 (or any value <= 0) to disable the heuristic.
+   */
+  decorativeImageSlideThreshold?: number;
 }
 
 /**

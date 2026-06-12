@@ -17,6 +17,7 @@ import {
 import { UnsupportedFileTypeError, ParsingError } from './error';
 import * as path from 'path';
 import * as fs from 'fs/promises';
+import { createHash } from 'crypto';
 
 // Import parsing libraries
 import pdf2md from '@opendocsg/pdf2md';
@@ -318,6 +319,8 @@ export class DocumentParsingModule {
 				slideText: string;
 				notes: string;
 				images: EmbeddedImage[];
+				/** Content hash (per image) used to de-duplicate identical images. */
+				imageHashes: string[];
 				descriptions: (string | undefined)[];
 			}
 			const slides: SlideWork[] = [];
@@ -336,26 +339,97 @@ export class DocumentParsingModule {
 					slideText: this._extractTextFromSlideXml(slideXml),
 					notes: await this._extractSlideNotes(zip, slidePath),
 					images,
+					imageHashes: images.map((img) =>
+						createHash('sha1').update(img.data).digest('hex')
+					),
 					descriptions: new Array(images.length),
 				});
 			}
 
-			// --- Phase 2: describe all images concurrently (bounded), if enabled. ---
-			// Slow LLM calls run in parallel across the whole deck so image-heavy
-			// files don't take (sum of every call) time; output order is preserved.
+			// --- Phase 2: describe images concurrently (bounded), if enabled. ---
+			// Two optimisations keep image-heavy decks fast and their output clean:
+			//   1. De-duplication. Identical image bytes — an icon reused on every
+			//      slide, a vector graphic stored beside its raster fallback, or the
+			//      same picture stacked several times on one slide — are described
+			//      ONCE and the result is reused wherever the image recurs.
+			//   2. Decorative-template skipping. An image that appears on many
+			//      distinct slides is almost always a non-content element (bullet
+			//      icon, logo, divider, doodle/thought-bubble). Describing it wastes
+			//      calls and, with smaller vision models, invites confident
+			//      hallucination, so such images are skipped entirely.
+			// Slow LLM calls still run in parallel across the deck; output order is
+			// always preserved.
 			if (describer) {
-				const tasks: Array<{ slide: SlideWork; index: number }> = [];
+				// Map each unique image (by content hash) to the distinct slides it
+				// appears on, keeping one representative occurrence to describe.
+				const slidesByHash = new Map<string, Set<number>>();
+				const representativeByHash = new Map<string, EmbeddedImage>();
 				for (const slide of slides) {
-					slide.images.forEach((_image, index) => tasks.push({ slide, index }));
+					slide.imageHashes.forEach((hash, index) => {
+						let slideSet = slidesByHash.get(hash);
+						if (!slideSet) {
+							slideSet = new Set<number>();
+							slidesByHash.set(hash, slideSet);
+							representativeByHash.set(hash, slide.images[index]);
+						}
+						slideSet.add(slide.slideNumber);
+					});
 				}
+
+				// An image reused on at least this many distinct slides is treated as
+				// a decorative/template element and skipped. A value <= 0 disables
+				// the heuristic (every unique image is still described only once).
+				const decorativeThreshold =
+					this.config.decorativeImageSlideThreshold ?? 5;
+				const decorativeHashes = new Set<string>();
+				if (decorativeThreshold > 0) {
+					for (const [hash, slideSet] of slidesByHash) {
+						if (slideSet.size >= decorativeThreshold) {
+							decorativeHashes.add(hash);
+						}
+					}
+				}
+
+				// Describe each unique, non-decorative image exactly once.
+				const hashesToDescribe = [...representativeByHash.keys()].filter(
+					(hash) => !decorativeHashes.has(hash)
+				);
+				const descriptionByHash = new Map<string, string | undefined>();
 				const concurrency = Math.max(1, this.config.imageConcurrency ?? 5);
-				await this._mapWithConcurrency(tasks, concurrency, async (task) => {
-					const description = await this._describeImageSafely(
-						describer,
-						task.slide.images[task.index]
+				await this._mapWithConcurrency(
+					hashesToDescribe,
+					concurrency,
+					async (hash) => {
+						const description = await this._describeImageSafely(
+							describer,
+							representativeByHash.get(hash)!
+						);
+						descriptionByHash.set(
+							hash,
+							description && description.trim()
+								? description.trim()
+								: undefined
+						);
+					}
+				);
+
+				// Fan the per-image descriptions back out onto every occurrence.
+				// Decorative (skipped) images stay undefined and are omitted later.
+				for (const slide of slides) {
+					slide.descriptions = slide.imageHashes.map((hash) =>
+						descriptionByHash.get(hash)
 					);
-					task.slide.descriptions[task.index] =
-						description && description.trim() ? description.trim() : undefined;
+				}
+
+				this.logger.debug('PPTX image de-duplication summary', {
+					filePath,
+					totalImagePlacements: slides.reduce(
+						(sum, s) => sum + s.images.length,
+						0
+					),
+					uniqueImages: slidesByHash.size,
+					describedImages: hashesToDescribe.length,
+					skippedDecorativeImages: decorativeHashes.size,
 				});
 			}
 
