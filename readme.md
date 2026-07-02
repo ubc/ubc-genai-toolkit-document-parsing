@@ -19,8 +19,12 @@ npm install ubc-genai-toolkit-document-parsing ubc-genai-toolkit-core
 -   **Supported Formats**: The module currently supports:
     -   PDF (`.pdf`)
     -   Microsoft Word (`.docx`)
+    -   Microsoft PowerPoint (`.pptx`)
     -   HTML (`.html`, `.htm`)
     -   Markdown (`.md`)
+-   **`imageDescriber`** _(optional)_: A provider-agnostic hook for turning images
+    embedded in documents (charts, screenshots, pictures in PowerPoint slides)
+    into text. See [Parsing images](#parsing-images-powerpoint).
 
 ## Configuration
 
@@ -72,6 +76,75 @@ async function parseDocument(filePath: string) {
 ```
 
 This example initializes the module and uses it to parse a file into both Markdown and plain text, printing the first 200 characters of each result.
+
+## PowerPoint (`.pptx`)
+
+PowerPoint files are parsed entirely in pure JavaScript (no LibreOffice or other
+system dependency). For each slide, in presentation order, the module extracts:
+
+-   slide text (under a `## Slide N` heading),
+-   speaker notes (under a `### Notes` heading),
+-   and — when an `imageDescriber` is configured — a text description of each
+    embedded image.
+
+### Parsing images (PowerPoint)
+
+The module never calls an LLM or holds an API key. Instead it exposes an optional
+`imageDescriber` hook. When provided, each embedded image is handed to your
+function and the returned text is inlined under its slide. When omitted, parsing
+is text-only and makes no external calls.
+
+```typescript
+import { DocumentParsingModule, EmbeddedImage } from 'ubc-genai-toolkit-document-parsing';
+
+// `imageDescriber` receives the image bytes + which slide it came from.
+// Plug in any vision model — here, the UBC GenAI Toolkit LLM module.
+const docParser = new DocumentParsingModule({
+	imageDescriber: async (image: EmbeddedImage) => {
+		const response = await llm.sendConversation(
+			[
+				{
+					role: 'user',
+					content: 'Describe this image from a lecture slide in 1-2 sentences.',
+					images: [{ data: image.data.toString('base64'), mimeType: image.mimeType }],
+				},
+			],
+			{ model: 'gpt-5-nano' }
+		);
+		return response.content;
+	},
+});
+
+const { content } = await docParser.parse({ filePath: 'lecture.pptx' }, 'markdown');
+```
+
+Each image is passed as an `EmbeddedImage` (`{ data: Buffer, mimeType, slideNumber, imageIndex, fileName }`).
+The hook is resilient: if it throws or returns an empty value for one image, that
+image is simply skipped and the rest of the parse continues.
+
+### Per-slide processing (`onSlide`)
+
+For large, image-heavy decks you may not want to handle the whole file as a
+single unit. Provide an `onSlide` callback and the module invokes it once per
+slide, in presentation order, as each slide finishes parsing — so you can embed
+or store each slide independently instead of waiting for (and holding) the entire
+document. `parse()` still returns the full concatenated content as well.
+
+```typescript
+const docParser = new DocumentParsingModule({
+	imageDescriber,
+	onSlide: async (slide) => {
+		// slide = { slideNumber, markdown, text, describedImageCount }
+		await indexSlide(slide.slideNumber, slide.text); // e.g. embed this slide alone
+	},
+});
+
+await docParser.parse({ filePath: 'lecture.pptx' }, 'markdown');
+```
+
+Each `ParsedSlide` carries that slide's `markdown` and plain `text` (heading +
+text + image descriptions + notes) plus `describedImageCount`. If the callback
+returns a promise, parsing awaits it before moving to the next slide.
 
 ## Error Handling
 

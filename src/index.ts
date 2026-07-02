@@ -11,6 +11,10 @@ export {
 	SupportedInputMimeType,
 	SupportedInputExtension,
 	SupportedOutputFormat,
+	EmbeddedImage,
+	ImageDescriber,
+	ParsedSlide,
+	SlideCallback,
 } from './types';
 
 // Export custom error types
