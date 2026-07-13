@@ -25,9 +25,37 @@ import mammoth from 'mammoth';
 import TurndownService from 'turndown';
 import markdownToText from 'markdown-to-text';
 import JSZip from 'jszip';
+import { PNG } from 'pngjs';
 
 const PPTX_MIME_TYPE =
 	'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+
+/**
+ * Placeholder URI scheme used to mark where each embedded DOCX image sat in
+ * the converted markdown, so its textual description can be spliced in at the
+ * exact position after (async) description completes.
+ */
+const DOCX_IMAGE_PLACEHOLDER_SCHEME = 'docparse-image://';
+
+/**
+ * Embedded PDF images narrower or shorter than this (in pixels) are treated
+ * as typographic decorations (bullets, rules, glyph fragments) and skipped.
+ */
+const MIN_PDF_IMAGE_DIMENSION = 40;
+
+/**
+ * Embedded PDF images are downscaled so their long edge is at most this many
+ * pixels before PNG encoding — plenty for vision models while keeping the
+ * payload well under provider size limits.
+ */
+const MAX_PDF_IMAGE_DIMENSION = 1500;
+
+/**
+ * Marker @opendocsg/pdf2md places between pages in its markdown output. Used
+ * to inline each PDF image description on the page it belongs to; always
+ * stripped from the final content.
+ */
+const PDF2MD_PAGE_BREAK_MARKER = '<!-- PAGE_BREAK -->';
 
 /** Maps common image file extensions found in PPTX archives to MIME types. */
 const IMAGE_EXTENSION_MIME_TYPES: Record<string, string> = {
@@ -241,7 +269,15 @@ export class DocumentParsingModule {
 		}
 	}
 
-	/** Parses PDF content. */
+	/**
+	 * Parses PDF content. Text is extracted with pdf2md as before; when an
+	 * {@link ImageDescriber} is configured, embedded raster images are also
+	 * extracted (per page, via pdfjs) and their textual descriptions inlined
+	 * as `> [Image, page N] ...` blocks at the end of the page they appear on
+	 * — mirroring how PPTX keeps descriptions with their slide. Image
+	 * extraction failures never fail the overall parse — the text-only result
+	 * is returned instead.
+	 */
 	private async _parsePdf(
 		filePath: string,
 		outputFormat: SupportedOutputFormat
@@ -251,8 +287,68 @@ export class DocumentParsingModule {
 			// Read the file content into a buffer
 			const pdfBuffer = await fs.readFile(filePath);
 
-			// Pass the buffer to pdf2md
-			const markdownContent = await pdf2md(pdfBuffer);
+			// Pass the buffer to pdf2md. Its output joins pages with an HTML
+			// comment marker, which we use to keep image descriptions with their
+			// page (and strip from the final output either way).
+			const rawMarkdown = await pdf2md(pdfBuffer);
+			const pageMarkdowns = rawMarkdown.split(PDF2MD_PAGE_BREAK_MARKER);
+
+			const describer = this.config.imageDescriber;
+			if (describer) {
+				try {
+					const images = await this._extractPdfImages(pdfBuffer, filePath);
+					if (images.length > 0) {
+						const descriptions = await this._describeImages(
+							describer,
+							images,
+							images.map((img) => img.pageNumber ?? 0),
+							{ filePath, docType: 'PDF' }
+						);
+
+						// Group the description blocks by the page they belong to.
+						const blocksByPage = new Map<number, string[]>();
+						images.forEach((img, index) => {
+							const description = descriptions[index];
+							if (!description) {
+								return;
+							}
+							const pageNumber = img.pageNumber ?? 0;
+							const block = `> [Image, page ${pageNumber}] ${description}`;
+							const blocks = blocksByPage.get(pageNumber);
+							if (blocks) {
+								blocks.push(block);
+							} else {
+								blocksByPage.set(pageNumber, [block]);
+							}
+						});
+
+						for (const [pageNumber, blocks] of blocksByPage) {
+							if (pageNumber >= 1 && pageNumber <= pageMarkdowns.length) {
+								// Inline at the end of the page's own text.
+								pageMarkdowns[pageNumber - 1] =
+									`${pageMarkdowns[pageNumber - 1].trim()}\n\n${blocks.join('\n\n')}`;
+							} else {
+								// Page marker mismatch (unexpected): never drop a
+								// description — append it to the last page instead.
+								const last = pageMarkdowns.length - 1;
+								pageMarkdowns[last] =
+									`${pageMarkdowns[last].trim()}\n\n${blocks.join('\n\n')}`;
+							}
+						}
+					}
+				} catch (error) {
+					this.logger.warn(
+						'PDF image extraction failed; returning text-only content',
+						{ filePath, error }
+					);
+				}
+			}
+
+			const markdownContent = pageMarkdowns
+				.map((page) => page.trim())
+				.filter((page) => page.length > 0)
+				.join('\n\n');
+
 			if (outputFormat === 'markdown') {
 				return markdownContent;
 			} else {
@@ -265,23 +361,322 @@ export class DocumentParsingModule {
 		}
 	}
 
-	/** Parses DOCX content. */
+	/**
+	 * Extracts embedded raster images from a PDF, page by page, using pdfjs.
+	 * Decoded pixel data is re-encoded as PNG so any vision model can consume
+	 * it regardless of the image's original encoding inside the PDF. Tiny
+	 * images (bullets, rules, glyph fragments) are skipped, and any single
+	 * image that fails to decode is skipped without aborting extraction.
+	 */
+	private async _extractPdfImages(
+		pdfBuffer: Buffer,
+		filePath: string
+	): Promise<EmbeddedImage[]> {
+		// pdfjs-dist v4 is ESM-only; dynamic-import it the same way as file-type
+		// (via Function constructor to survive the tsc CommonJS transform).
+		const dynamicImport = new Function('specifier', 'return import(specifier)');
+		const pdfjs = await dynamicImport('pdfjs-dist/legacy/build/pdf.mjs');
+
+		// pdf2md (via its `unpdf` dependency) bundles a DIFFERENT pdfjs version
+		// and leaves its worker on `globalThis.pdfjsWorker`, which pdfjs checks
+		// BEFORE loading its own matching worker — producing an API/Worker
+		// version-mismatch error. Hide any foreign global worker while our
+		// document initialises (pdfjs caches its own worker after first use).
+		const globalScope = globalThis as any;
+		const foreignWorker = globalScope.pdfjsWorker;
+		if (foreignWorker) {
+			delete globalScope.pdfjsWorker;
+		}
+
+		let doc;
+		try {
+			doc = await pdfjs.getDocument({
+				data: new Uint8Array(pdfBuffer),
+				useSystemFonts: true,
+				isEvalSupported: false,
+				verbosity: 0,
+			}).promise;
+		} finally {
+			if (foreignWorker) {
+				globalScope.pdfjsWorker = foreignWorker;
+			}
+		}
+
+		const images: EmbeddedImage[] = [];
+		try {
+			for (let pageNumber = 1; pageNumber <= doc.numPages; pageNumber++) {
+				let page;
+				try {
+					page = await doc.getPage(pageNumber);
+					const opList = await page.getOperatorList();
+
+					// Collect the ids of image XObjects painted on this page, in
+					// paint order, ignoring repeat paints of the same object.
+					const seenIds = new Set<string>();
+					const orderedIds: string[] = [];
+					for (let i = 0; i < opList.fnArray.length; i++) {
+						if (opList.fnArray[i] === pdfjs.OPS.paintImageXObject) {
+							const objId = opList.argsArray[i]?.[0];
+							if (typeof objId === 'string' && !seenIds.has(objId)) {
+								seenIds.add(objId);
+								orderedIds.push(objId);
+							}
+						}
+					}
+
+					let imageIndex = 0;
+					for (const objId of orderedIds) {
+						try {
+							const imgObj = await this._resolvePdfObject(page, objId);
+							const png = this._pdfImageToPng(pdfjs, imgObj);
+							if (!png) {
+								continue; // Tiny/undecodable image.
+							}
+							images.push({
+								data: png,
+								mimeType: 'image/png',
+								source: 'pdf',
+								pageNumber,
+								imageIndex: imageIndex++,
+								fileName: objId,
+							});
+						} catch (error) {
+							this.logger.warn(
+								'Failed to decode embedded PDF image; skipping',
+								{ filePath, pageNumber, objId, error }
+							);
+						}
+					}
+				} finally {
+					page?.cleanup();
+				}
+			}
+		} finally {
+			await doc.destroy();
+		}
+		return images;
+	}
+
+	/**
+	 * Resolves a pdfjs object id to its decoded image object, checking the
+	 * page-local store first and falling back to the document-common store.
+	 */
+	private _resolvePdfObject(page: any, objId: string): Promise<any> {
+		return new Promise((resolve, reject) => {
+			try {
+				page.objs.get(objId, (obj: any) => resolve(obj));
+			} catch {
+				try {
+					page.commonObjs.get(objId, (obj: any) => resolve(obj));
+				} catch (error) {
+					reject(error);
+				}
+			}
+		});
+	}
+
+	/**
+	 * Converts a decoded pdfjs image object ({width, height, kind, data}) into
+	 * a PNG buffer, or returns undefined for images too small to carry content
+	 * (bullets, rules) or in a pixel layout we don't handle.
+	 */
+	private _pdfImageToPng(pdfjs: any, imgObj: any): Buffer | undefined {
+		if (!imgObj || !imgObj.data || !imgObj.width || !imgObj.height) {
+			return undefined;
+		}
+		const { width, height, kind } = imgObj;
+		// Skip tiny decorations — they carry no instructional content and can
+		// number in the hundreds in a typeset PDF.
+		if (width < MIN_PDF_IMAGE_DIMENSION || height < MIN_PDF_IMAGE_DIMENSION) {
+			return undefined;
+		}
+
+		const src: Uint8Array = imgObj.data;
+		const rgba = Buffer.alloc(width * height * 4);
+		if (kind === pdfjs.ImageKind.RGBA_32BPP) {
+			rgba.set(src.subarray(0, width * height * 4));
+		} else if (kind === pdfjs.ImageKind.RGB_24BPP) {
+			for (let p = 0, s = 0, d = 0; p < width * height; p++, s += 3, d += 4) {
+				rgba[d] = src[s];
+				rgba[d + 1] = src[s + 1];
+				rgba[d + 2] = src[s + 2];
+				rgba[d + 3] = 255;
+			}
+		} else if (kind === pdfjs.ImageKind.GRAYSCALE_1BPP) {
+			// 1 bit per pixel, each row padded to a whole byte.
+			const rowBytes = Math.ceil(width / 8);
+			for (let y = 0; y < height; y++) {
+				for (let x = 0; x < width; x++) {
+					const bit = (src[y * rowBytes + (x >> 3)] >> (7 - (x & 7))) & 1;
+					const value = bit ? 255 : 0;
+					const d = (y * width + x) * 4;
+					rgba[d] = value;
+					rgba[d + 1] = value;
+					rgba[d + 2] = value;
+					rgba[d + 3] = 255;
+				}
+			}
+		} else {
+			return undefined; // Unknown pixel layout.
+		}
+
+		// Downscale very large images before PNG-encoding: vision models don't
+		// need more than ~1500px on the long edge, and raw re-encoded PDF images
+		// can otherwise exceed provider payload limits.
+		let outWidth = width;
+		let outHeight = height;
+		let outData: Buffer = rgba;
+		const longEdge = Math.max(width, height);
+		if (longEdge > MAX_PDF_IMAGE_DIMENSION) {
+			const scale = MAX_PDF_IMAGE_DIMENSION / longEdge;
+			outWidth = Math.max(1, Math.round(width * scale));
+			outHeight = Math.max(1, Math.round(height * scale));
+			outData = this._downscaleRgba(rgba, width, height, outWidth, outHeight);
+		}
+
+		const png = new PNG({ width: outWidth, height: outHeight });
+		outData.copy(png.data);
+		return PNG.sync.write(png);
+	}
+
+	/**
+	 * Downscales RGBA pixel data with a box filter (averaging every source
+	 * pixel that maps onto each destination pixel), which keeps thin lines and
+	 * text in figures legible better than nearest-neighbour sampling.
+	 */
+	private _downscaleRgba(
+		src: Buffer,
+		srcWidth: number,
+		srcHeight: number,
+		dstWidth: number,
+		dstHeight: number
+	): Buffer {
+		const dst = Buffer.alloc(dstWidth * dstHeight * 4);
+		for (let dy = 0; dy < dstHeight; dy++) {
+			const y0 = Math.floor((dy * srcHeight) / dstHeight);
+			const y1 = Math.max(y0 + 1, Math.floor(((dy + 1) * srcHeight) / dstHeight));
+			for (let dx = 0; dx < dstWidth; dx++) {
+				const x0 = Math.floor((dx * srcWidth) / dstWidth);
+				const x1 = Math.max(x0 + 1, Math.floor(((dx + 1) * srcWidth) / dstWidth));
+				let r = 0;
+				let g = 0;
+				let b = 0;
+				let a = 0;
+				const count = (y1 - y0) * (x1 - x0);
+				for (let sy = y0; sy < y1; sy++) {
+					for (let sx = x0; sx < x1; sx++) {
+						const s = (sy * srcWidth + sx) * 4;
+						r += src[s];
+						g += src[s + 1];
+						b += src[s + 2];
+						a += src[s + 3];
+					}
+				}
+				const d = (dy * dstWidth + dx) * 4;
+				dst[d] = Math.round(r / count);
+				dst[d + 1] = Math.round(g / count);
+				dst[d + 2] = Math.round(b / count);
+				dst[d + 3] = Math.round(a / count);
+			}
+		}
+		return dst;
+	}
+
+	/**
+	 * Parses DOCX content. Embedded images are never emitted as inline base64
+	 * blobs (mammoth's default, which produced enormous unreadable data URIs in
+	 * the markdown output). Instead, when an {@link ImageDescriber} is
+	 * configured each image is extracted and replaced in-place with a
+	 * `> [Image] ...` textual description; without a describer, images are
+	 * simply omitted.
+	 */
 	private async _parseDocx(
 		filePath: string,
 		outputFormat: SupportedOutputFormat
 	): Promise<string> {
 		this.logger.debug('Parsing DOCX', { filePath, outputFormat });
 		try {
-			// 1. Convert DOCX to HTML
-			const { value: htmlContent } = await mammoth.convertToHtml({ path: filePath });
+			const describer = this.config.imageDescriber;
+
+			// 1. Convert DOCX to HTML, intercepting embedded images. Each
+			// describable image is collected and replaced by a positional
+			// placeholder URI so its description can be inlined at the exact spot
+			// the image appeared; everything else becomes an empty <img> that is
+			// stripped after markdown conversion.
+			const collectedImages: EmbeddedImage[] = [];
+			const convertImage = (mammoth.images as any).imgElement(
+				async (image: any) => {
+					if (!describer) {
+						return { src: '' };
+					}
+					try {
+						const mimeType: string =
+							image.contentType || 'application/octet-stream';
+						if (!this._isDescribableImage(mimeType)) {
+							return { src: '' }; // Vector/unknown formats vision models can't read.
+						}
+						// Newer mammoth exposes readAsBase64String; older read('base64').
+						const base64: string =
+							typeof image.readAsBase64String === 'function'
+								? await image.readAsBase64String()
+								: await image.read('base64');
+						const index = collectedImages.length;
+						collectedImages.push({
+							data: Buffer.from(base64, 'base64'),
+							mimeType,
+							source: 'docx',
+							imageIndex: index,
+						});
+						return { src: `${DOCX_IMAGE_PLACEHOLDER_SCHEME}${index}` };
+					} catch (error) {
+						this.logger.warn(
+							'Failed to read embedded DOCX image; skipping',
+							{ filePath, error }
+						);
+						return { src: '' };
+					}
+				}
+			);
+			const { value: htmlContent } = await mammoth.convertToHtml(
+				{ path: filePath },
+				{ convertImage }
+			);
 
 			// 2. Convert HTML to Markdown
-			const markdownContent = this.turndownService.turndown(htmlContent);
+			let markdownContent = this.turndownService.turndown(htmlContent);
+
+			// 3. Describe collected images (de-duplicated, bounded concurrency)
+			// and splice each description into the placeholder position.
+			if (describer && collectedImages.length > 0) {
+				const descriptions = await this._describeImages(
+					describer,
+					collectedImages,
+					// Each occurrence is its own "unit": an image repeated many
+					// times throughout the document is treated as decorative.
+					collectedImages.map((img) => img.imageIndex + 1),
+					{ filePath, docType: 'DOCX' }
+				);
+				const placeholderRegex = new RegExp(
+					`!\\[[^\\]]*\\]\\(${DOCX_IMAGE_PLACEHOLDER_SCHEME}(\\d+)\\)`,
+					'g'
+				);
+				markdownContent = markdownContent.replace(
+					placeholderRegex,
+					(_match, indexStr) => {
+						const description = descriptions[parseInt(indexStr, 10)];
+						return description ? `> [Image] ${description}` : '';
+					}
+				);
+			}
+
+			// 4. Strip any leftover empty image tags (non-describable images, or
+			// all images when no describer is configured).
+			markdownContent = markdownContent.replace(/!\[[^\]]*\]\(\s*\)/g, '');
 
 			if (outputFormat === 'markdown') {
 				return markdownContent;
 			} else {
-				// 3. Convert Markdown to Text
+				// 5. Convert Markdown to Text
 				return markdownToText(markdownContent);
 			}
 		} catch (error) {
@@ -319,8 +714,6 @@ export class DocumentParsingModule {
 				slideText: string;
 				notes: string;
 				images: EmbeddedImage[];
-				/** Content hash (per image) used to de-duplicate identical images. */
-				imageHashes: string[];
 				descriptions: (string | undefined)[];
 			}
 			const slides: SlideWork[] = [];
@@ -339,98 +732,37 @@ export class DocumentParsingModule {
 					slideText: this._extractTextFromSlideXml(slideXml),
 					notes: await this._extractSlideNotes(zip, slidePath),
 					images,
-					imageHashes: images.map((img) =>
-						createHash('sha1').update(img.data).digest('hex')
-					),
 					descriptions: new Array(images.length),
 				});
 			}
 
 			// --- Phase 2: describe images concurrently (bounded), if enabled. ---
-			// Two optimisations keep image-heavy decks fast and their output clean:
-			//   1. De-duplication. Identical image bytes — an icon reused on every
-			//      slide, a vector graphic stored beside its raster fallback, or the
-			//      same picture stacked several times on one slide — are described
-			//      ONCE and the result is reused wherever the image recurs.
-			//   2. Decorative-template skipping. An image that appears on many
-			//      distinct slides is almost always a non-content element (bullet
-			//      icon, logo, divider, doodle/thought-bubble). Describing it wastes
-			//      calls and, with smaller vision models, invites confident
-			//      hallucination, so such images are skipped entirely.
-			// Slow LLM calls still run in parallel across the deck; output order is
-			// always preserved.
+			// De-duplication and decorative-template skipping happen inside
+			// _describeImages; slow LLM calls run in parallel across the deck while
+			// output order is always preserved.
 			if (describer) {
-				// Map each unique image (by content hash) to the distinct slides it
-				// appears on, keeping one representative occurrence to describe.
-				const slidesByHash = new Map<string, Set<number>>();
-				const representativeByHash = new Map<string, EmbeddedImage>();
+				const flatImages: EmbeddedImage[] = [];
+				const flatUnits: number[] = [];
 				for (const slide of slides) {
-					slide.imageHashes.forEach((hash, index) => {
-						let slideSet = slidesByHash.get(hash);
-						if (!slideSet) {
-							slideSet = new Set<number>();
-							slidesByHash.set(hash, slideSet);
-							representativeByHash.set(hash, slide.images[index]);
-						}
-						slideSet.add(slide.slideNumber);
-					});
-				}
-
-				// An image reused on at least this many distinct slides is treated as
-				// a decorative/template element and skipped. A value <= 0 disables
-				// the heuristic (every unique image is still described only once).
-				const decorativeThreshold =
-					this.config.decorativeImageSlideThreshold ?? 5;
-				const decorativeHashes = new Set<string>();
-				if (decorativeThreshold > 0) {
-					for (const [hash, slideSet] of slidesByHash) {
-						if (slideSet.size >= decorativeThreshold) {
-							decorativeHashes.add(hash);
-						}
+					for (const image of slide.images) {
+						flatImages.push(image);
+						flatUnits.push(slide.slideNumber);
 					}
 				}
-
-				// Describe each unique, non-decorative image exactly once.
-				const hashesToDescribe = [...representativeByHash.keys()].filter(
-					(hash) => !decorativeHashes.has(hash)
-				);
-				const descriptionByHash = new Map<string, string | undefined>();
-				const concurrency = Math.max(1, this.config.imageConcurrency ?? 5);
-				await this._mapWithConcurrency(
-					hashesToDescribe,
-					concurrency,
-					async (hash) => {
-						const description = await this._describeImageSafely(
-							describer,
-							representativeByHash.get(hash)!
-						);
-						descriptionByHash.set(
-							hash,
-							description && description.trim()
-								? description.trim()
-								: undefined
-						);
-					}
+				const flatDescriptions = await this._describeImages(
+					describer,
+					flatImages,
+					flatUnits,
+					{ filePath, docType: 'PPTX' }
 				);
 
-				// Fan the per-image descriptions back out onto every occurrence.
-				// Decorative (skipped) images stay undefined and are omitted later.
+				// Fan the per-image descriptions back out onto each slide.
+				let cursor = 0;
 				for (const slide of slides) {
-					slide.descriptions = slide.imageHashes.map((hash) =>
-						descriptionByHash.get(hash)
+					slide.descriptions = slide.images.map(
+						() => flatDescriptions[cursor++]
 					);
 				}
-
-				this.logger.debug('PPTX image de-duplication summary', {
-					filePath,
-					totalImagePlacements: slides.reduce(
-						(sum, s) => sum + s.images.length,
-						0
-					),
-					uniqueImages: slidesByHash.size,
-					describedImages: hashesToDescribe.length,
-					skippedDecorativeImages: decorativeHashes.size,
-				});
 			}
 
 			// --- Phase 3: assemble each slide in order; deliver via onSlide. ---
@@ -549,6 +881,96 @@ export class DocumentParsingModule {
 	private _slideFileNumber(slidePath: string): number {
 		const match = slidePath.match(/slide(\d+)\.xml$/);
 		return match ? parseInt(match[1], 10) : 0;
+	}
+
+	/**
+	 * Describes a batch of embedded images via the consumer-supplied describer,
+	 * with the optimisations shared by every document format:
+	 *   1. De-duplication. Identical image bytes — an icon reused on every
+	 *      slide/page, a vector graphic stored beside its raster fallback, or
+	 *      the same picture placed several times — are described ONCE and the
+	 *      result reused wherever the image recurs.
+	 *   2. Decorative-template skipping. An image that appears in many distinct
+	 *      units (slides for PPTX, pages for PDF, occurrences for DOCX) is
+	 *      almost always a non-content element (bullet icon, logo, divider).
+	 *      Describing it wastes calls and, with smaller vision models, invites
+	 *      confident hallucination, so such images are skipped entirely.
+	 * Describer calls run in parallel with bounded concurrency; the returned
+	 * array is parallel to `images` (undefined = no description / skipped).
+	 *
+	 * @param images - The images to describe, in document order.
+	 * @param unitNumbers - Parallel array giving the unit (slide/page/occurrence
+	 *   number) each image belongs to, used by the decorative heuristic.
+	 */
+	private async _describeImages(
+		describer: NonNullable<DocumentParsingConfig['imageDescriber']>,
+		images: EmbeddedImage[],
+		unitNumbers: number[],
+		logContext: { filePath: string; docType: string }
+	): Promise<(string | undefined)[]> {
+		if (images.length === 0) {
+			return [];
+		}
+
+		// Map each unique image (by content hash) to the distinct units it
+		// appears in, keeping one representative occurrence to describe.
+		const hashes = images.map((img) =>
+			createHash('sha1').update(img.data).digest('hex')
+		);
+		const unitsByHash = new Map<string, Set<number>>();
+		const representativeByHash = new Map<string, EmbeddedImage>();
+		hashes.forEach((hash, index) => {
+			let unitSet = unitsByHash.get(hash);
+			if (!unitSet) {
+				unitSet = new Set<number>();
+				unitsByHash.set(hash, unitSet);
+				representativeByHash.set(hash, images[index]);
+			}
+			unitSet.add(unitNumbers[index]);
+		});
+
+		// An image reused in at least this many distinct units is treated as a
+		// decorative/template element and skipped. A value <= 0 disables the
+		// heuristic (every unique image is still described only once).
+		const decorativeThreshold =
+			this.config.decorativeImageSlideThreshold ?? 5;
+		const decorativeHashes = new Set<string>();
+		if (decorativeThreshold > 0) {
+			for (const [hash, unitSet] of unitsByHash) {
+				if (unitSet.size >= decorativeThreshold) {
+					decorativeHashes.add(hash);
+				}
+			}
+		}
+
+		// Describe each unique, non-decorative image exactly once.
+		const hashesToDescribe = [...representativeByHash.keys()].filter(
+			(hash) => !decorativeHashes.has(hash)
+		);
+		const descriptionByHash = new Map<string, string | undefined>();
+		const concurrency = Math.max(1, this.config.imageConcurrency ?? 5);
+		await this._mapWithConcurrency(hashesToDescribe, concurrency, async (hash) => {
+			const description = await this._describeImageSafely(
+				describer,
+				representativeByHash.get(hash)!
+			);
+			descriptionByHash.set(
+				hash,
+				description && description.trim() ? description.trim() : undefined
+			);
+		});
+
+		this.logger.debug(`${logContext.docType} image de-duplication summary`, {
+			filePath: logContext.filePath,
+			totalImagePlacements: images.length,
+			uniqueImages: unitsByHash.size,
+			describedImages: hashesToDescribe.length,
+			skippedDecorativeImages: decorativeHashes.size,
+		});
+
+		// Fan the per-image descriptions back out onto every occurrence.
+		// Decorative (skipped) images stay undefined and are omitted by callers.
+		return hashes.map((hash) => descriptionByHash.get(hash));
 	}
 
 	/**
@@ -671,6 +1093,7 @@ export class DocumentParsingModule {
 			images.push({
 				data,
 				mimeType,
+				source: 'pptx',
 				slideNumber,
 				imageIndex: images.length,
 				fileName: mediaPath.substring(mediaPath.lastIndexOf('/') + 1),
