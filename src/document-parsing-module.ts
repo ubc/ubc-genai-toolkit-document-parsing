@@ -296,44 +296,50 @@ export class DocumentParsingModule {
 			const describer = this.config.imageDescriber;
 			if (describer) {
 				try {
-					const images = await this._extractPdfImages(pdfBuffer, filePath);
-					if (images.length > 0) {
+					const extracted = await this._extractPdfImages(pdfBuffer, filePath);
+					if (extracted.length > 0) {
 						const descriptions = await this._describeImages(
 							describer,
-							images,
-							images.map((img) => img.pageNumber ?? 0),
+							extracted.map((entry) => entry.image),
+							extracted.map((entry) => entry.image.pageNumber ?? 0),
 							{ filePath, docType: 'PDF' }
 						);
 
-						// Group the description blocks by the page they belong to.
-						const blocksByPage = new Map<number, string[]>();
-						images.forEach((img, index) => {
+						// Group each described image (with its vertical position)
+						// by the page it belongs to.
+						const entriesByPage = new Map<
+							number,
+							Array<{ ratio: number; block: string }>
+						>();
+						extracted.forEach((entry, index) => {
 							const description = descriptions[index];
 							if (!description) {
 								return;
 							}
-							const pageNumber = img.pageNumber ?? 0;
+							const pageNumber = entry.image.pageNumber ?? 0;
 							const block = `> [Image, page ${pageNumber}] ${description}`;
-							const blocks = blocksByPage.get(pageNumber);
-							if (blocks) {
-								blocks.push(block);
+							const list = entriesByPage.get(pageNumber);
+							if (list) {
+								list.push({ ratio: entry.splitRatio, block });
 							} else {
-								blocksByPage.set(pageNumber, [block]);
+								entriesByPage.set(pageNumber, [
+									{ ratio: entry.splitRatio, block },
+								]);
 							}
 						});
 
-						for (const [pageNumber, blocks] of blocksByPage) {
-							if (pageNumber >= 1 && pageNumber <= pageMarkdowns.length) {
-								// Inline at the end of the page's own text.
-								pageMarkdowns[pageNumber - 1] =
-									`${pageMarkdowns[pageNumber - 1].trim()}\n\n${blocks.join('\n\n')}`;
-							} else {
-								// Page marker mismatch (unexpected): never drop a
-								// description — append it to the last page instead.
-								const last = pageMarkdowns.length - 1;
-								pageMarkdowns[last] =
-									`${pageMarkdowns[last].trim()}\n\n${blocks.join('\n\n')}`;
-							}
+						for (const [pageNumber, entries] of entriesByPage) {
+							// Inline each description at its position within the
+							// page's own text (snapped to a paragraph boundary).
+							// A page-marker mismatch falls back to the last page.
+							const targetIndex =
+								pageNumber >= 1 && pageNumber <= pageMarkdowns.length
+									? pageNumber - 1
+									: pageMarkdowns.length - 1;
+							pageMarkdowns[targetIndex] = this._insertPdfImageBlocks(
+								pageMarkdowns[targetIndex],
+								entries
+							);
 						}
 					}
 				} catch (error) {
@@ -362,16 +368,93 @@ export class DocumentParsingModule {
 	}
 
 	/**
+	 * Inserts image-description blocks into a page's markdown at the vertical
+	 * position each image occupies, expressed as a `ratio` in [0, 1] of the
+	 * characters above it. Insertion is snapped to a paragraph boundary so a
+	 * description never lands mid-sentence or inside a table. When the page has
+	 * no text, the blocks (in top-to-bottom order) become the page's content.
+	 */
+	private _insertPdfImageBlocks(
+		pageText: string,
+		entries: Array<{ ratio: number; block: string }>
+	): string {
+		const ordered = [...entries].sort((a, b) => a.ratio - b.ratio);
+		const paragraphs = pageText
+			.split(/\n{2,}/)
+			.map((paragraph) => paragraph.trim())
+			.filter((paragraph) => paragraph.length > 0);
+
+		if (paragraphs.length === 0) {
+			return ordered.map((entry) => entry.block).join('\n\n');
+		}
+
+		const totalChars = paragraphs.reduce(
+			(sum, paragraph) => sum + paragraph.length,
+			0
+		);
+
+		// For each image, choose the paragraph index to insert *after* (-1 means
+		// before the first paragraph) by walking paragraphs until the cumulative
+		// character count passes the image's target position.
+		const blocksAfterIndex = new Map<number, string[]>();
+		for (const entry of ordered) {
+			const targetChar = Math.max(
+				0,
+				Math.min(totalChars, entry.ratio * totalChars)
+			);
+			let cumulative = 0;
+			let insertAfter = -1;
+			for (let i = 0; i < paragraphs.length; i++) {
+				cumulative += paragraphs[i].length;
+				if (cumulative <= targetChar) {
+					insertAfter = i;
+				} else {
+					break;
+				}
+			}
+			const list = blocksAfterIndex.get(insertAfter);
+			if (list) {
+				list.push(entry.block);
+			} else {
+				blocksAfterIndex.set(insertAfter, [entry.block]);
+			}
+		}
+
+		const out: string[] = [];
+		const beforeFirst = blocksAfterIndex.get(-1);
+		if (beforeFirst) {
+			out.push(...beforeFirst);
+		}
+		for (let i = 0; i < paragraphs.length; i++) {
+			out.push(paragraphs[i]);
+			const after = blocksAfterIndex.get(i);
+			if (after) {
+				out.push(...after);
+			}
+		}
+		return out.join('\n\n');
+	}
+
+	/**
 	 * Extracts embedded raster images from a PDF, page by page, using pdfjs.
 	 * Decoded pixel data is re-encoded as PNG so any vision model can consume
 	 * it regardless of the image's original encoding inside the PDF. Tiny
 	 * images (bullets, rules, glyph fragments) are skipped, and any single
 	 * image that fails to decode is skipped without aborting extraction.
+	 *
+	 * Each returned image carries a `splitRatio` in [0, 1] describing where it
+	 * sits vertically within its page's text (0 = above all text, 1 = below all
+	 * text), computed from the fraction of the page's characters that lie above
+	 * the image. This lets the caller inline the description at the right point
+	 * in reading order rather than dumping it at the end of the page. pdf2md
+	 * discards positions, so the ratio is necessarily approximate and snapped to
+	 * a paragraph boundary; it defaults to 1 (append) when text geometry is
+	 * unavailable.
 	 */
 	private async _extractPdfImages(
 		pdfBuffer: Buffer,
 		filePath: string
-	): Promise<EmbeddedImage[]> {
+	): Promise<Array<{ image: EmbeddedImage; splitRatio: number }>> {
 		// pdfjs-dist v4 is ESM-only; dynamic-import it the same way as file-type
 		// (via Function constructor to survive the tsc CommonJS transform).
 		const dynamicImport = new Function('specifier', 'return import(specifier)');
@@ -402,7 +485,7 @@ export class DocumentParsingModule {
 			}
 		}
 
-		const images: EmbeddedImage[] = [];
+		const results: Array<{ image: EmbeddedImage; splitRatio: number }> = [];
 		try {
 			for (let pageNumber = 1; pageNumber <= doc.numPages; pageNumber++) {
 				let page;
@@ -411,18 +494,71 @@ export class DocumentParsingModule {
 					const opList = await page.getOperatorList();
 
 					// Collect the ids of image XObjects painted on this page, in
-					// paint order, ignoring repeat paints of the same object.
+					// paint order (ignoring repeat paints of the same object), and
+					// record the vertical centre of each image's first paint by
+					// tracking the current transformation matrix.
 					const seenIds = new Set<string>();
 					const orderedIds: string[] = [];
+					const centerYById = new Map<string, number>();
+					let ctm = [1, 0, 0, 1, 0, 0];
+					const ctmStack: number[][] = [];
 					for (let i = 0; i < opList.fnArray.length; i++) {
-						if (opList.fnArray[i] === pdfjs.OPS.paintImageXObject) {
+						const fn = opList.fnArray[i];
+						if (fn === pdfjs.OPS.save) {
+							ctmStack.push(ctm.slice());
+						} else if (fn === pdfjs.OPS.restore) {
+							ctm = ctmStack.pop() || ctm;
+						} else if (fn === pdfjs.OPS.transform) {
+							ctm = this._multiplyMatrix(ctm, opList.argsArray[i]);
+						} else if (fn === pdfjs.OPS.paintImageXObject) {
 							const objId = opList.argsArray[i]?.[0];
 							if (typeof objId === 'string' && !seenIds.has(objId)) {
 								seenIds.add(objId);
 								orderedIds.push(objId);
+								// Image unit square maps y=0 -> ctm[5], y=1 -> ctm[5]+ctm[3].
+								const yA = ctm[5];
+								const yB = ctm[5] + ctm[3];
+								centerYById.set(objId, (yA + yB) / 2);
 							}
 						}
 					}
+
+					// Page text geometry: total characters and a helper that sums
+					// the characters lying above a given y (higher y == higher on
+					// the page in PDF user space).
+					let textItems: Array<{ y: number; len: number }> = [];
+					let totalChars = 0;
+					try {
+						const textContent = await page.getTextContent();
+						for (const item of textContent.items as any[]) {
+							const str: string = item.str || '';
+							if (!str) {
+								continue;
+							}
+							textItems.push({ y: item.transform[5], len: str.length });
+							totalChars += str.length;
+						}
+					} catch (error) {
+						this.logger.warn('Failed to read PDF page text geometry', {
+							filePath,
+							pageNumber,
+							error,
+						});
+						textItems = [];
+						totalChars = 0;
+					}
+					const splitRatioForCenter = (centerY: number): number => {
+						if (totalChars === 0) {
+							return 1; // No text to interleave with — append.
+						}
+						let charsAbove = 0;
+						for (const item of textItems) {
+							if (item.y >= centerY) {
+								charsAbove += item.len;
+							}
+						}
+						return charsAbove / totalChars;
+					};
 
 					let imageIndex = 0;
 					for (const objId of orderedIds) {
@@ -432,13 +568,20 @@ export class DocumentParsingModule {
 							if (!png) {
 								continue; // Tiny/undecodable image.
 							}
-							images.push({
-								data: png,
-								mimeType: 'image/png',
-								source: 'pdf',
-								pageNumber,
-								imageIndex: imageIndex++,
-								fileName: objId,
+							const centerY = centerYById.get(objId);
+							results.push({
+								image: {
+									data: png,
+									mimeType: 'image/png',
+									source: 'pdf',
+									pageNumber,
+									imageIndex: imageIndex++,
+									fileName: objId,
+								},
+								splitRatio:
+									centerY === undefined
+										? 1
+										: splitRatioForCenter(centerY),
 							});
 						} catch (error) {
 							this.logger.warn(
@@ -454,7 +597,24 @@ export class DocumentParsingModule {
 		} finally {
 			await doc.destroy();
 		}
-		return images;
+		return results;
+	}
+
+	/**
+	 * Multiplies the current transformation matrix by a pdfjs `transform`
+	 * operator's matrix (both in [a, b, c, d, e, f] form), returning the new
+	 * CTM. Used to locate where each image is painted on the page.
+	 */
+	private _multiplyMatrix(m: number[], t: number[]): number[] {
+		const [a, b, c, d, e, f] = t;
+		return [
+			m[0] * a + m[2] * b,
+			m[1] * a + m[3] * b,
+			m[0] * c + m[2] * d,
+			m[1] * c + m[3] * d,
+			m[0] * e + m[2] * f + m[4],
+			m[1] * e + m[3] * f + m[5],
+		];
 	}
 
 	/**
