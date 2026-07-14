@@ -1,5 +1,4 @@
 node_modules
-dist
 tsconfig.tsbuildinfo
 .DS_Store
 example/node_modules
