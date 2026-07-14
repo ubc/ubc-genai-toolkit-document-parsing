@@ -22,8 +22,9 @@ export type SupportedInputExtension = '.pdf' | '.docx' | '.pptx' | '.html' | '.h
 export type SupportedOutputFormat = 'text' | 'markdown';
 
 /**
- * An embedded image extracted from a document (currently PowerPoint slides),
- * passed to a consumer-supplied {@link ImageDescriber}.
+ * An embedded image extracted from a document (PowerPoint slides, Word
+ * documents, or PDF pages), passed to a consumer-supplied
+ * {@link ImageDescriber}.
  */
 export interface EmbeddedImage {
   /** The raw image bytes. */
@@ -31,14 +32,24 @@ export interface EmbeddedImage {
 
   /**
    * The image MIME type (e.g. 'image/png', 'image/jpeg'), inferred from the
-   * file extension inside the document.
+   * file extension inside the document (or 'image/png' for images re-encoded
+   * from raw PDF pixel data).
    */
   mimeType: string;
 
-  /** The 1-based slide number the image was found on. */
-  slideNumber: number;
+  /** The source document format the image was extracted from. */
+  source?: 'pptx' | 'docx' | 'pdf';
 
-  /** The 0-based index of this image within its slide (in document order). */
+  /** The 1-based slide number the image was found on (PPTX only). */
+  slideNumber?: number;
+
+  /** The 1-based page number the image was found on (PDF only). */
+  pageNumber?: number;
+
+  /**
+   * The 0-based index of this image within its slide (PPTX) or page (PDF),
+   * or within the whole document (DOCX), in document order.
+   */
   imageIndex: number;
 
   /** The original media filename inside the archive (e.g. 'image3.png'). */
@@ -106,9 +117,10 @@ export type SlideCallback = (slide: ParsedSlide) => void | Promise<void>;
 export interface DocumentParsingConfig extends ModuleConfig {
   /**
    * Optional hook for describing images embedded in documents (e.g. charts,
-   * screenshots and pictures inside PowerPoint slides). When supplied, the
-   * module extracts each embedded image and passes it to this function,
-   * inlining the returned text alongside the slide's text content.
+   * screenshots and pictures inside PowerPoint slides, Word documents and
+   * PDFs). When supplied, the module extracts each embedded image and passes
+   * it to this function, inlining the returned text alongside the document's
+   * text content.
    *
    * When omitted, parsing is text-only: no images are processed and no external
    * calls are made. See {@link ImageDescriber}.
@@ -135,8 +147,9 @@ export interface DocumentParsingConfig extends ModuleConfig {
 
   /**
    * Treat an embedded image as a decorative/template element (and skip
-   * describing it) when the *same image* appears on at least this many distinct
-   * slides. Recurring icons, logos, dividers and doodles carry no instructional
+   * describing it) when the *same image* appears in at least this many distinct
+   * places — slides for PPTX, pages for PDF, occurrences for DOCX. Recurring
+   * icons, logos, dividers and doodles carry no instructional
    * content, and describing them wastes describer calls and can trigger
    * hallucinated descriptions on smaller vision models.
    *

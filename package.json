@@ -1,6 +1,6 @@
 {
   "name": "ubc-genai-toolkit-document-parsing",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A module for the UBC GenAI Toolkit that provides a standardized interface for parsing text content from various document formats like PDF, DOCX, PPTX, and HTML.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -18,11 +18,13 @@
     "mammoth": "^1.9.0",
     "markdown-to-text": "^0.1.1",
     "pdfjs-dist": "^4.2.67",
+    "pngjs": "^7.0.0",
     "turndown": "^7.2.0",
     "ubc-genai-toolkit-core": "^0.1.0"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",
+    "@types/pngjs": "^6.0.5",
     "@types/turndown": "^5.0.5",
     "typescript": "^5.8.3"
   },
