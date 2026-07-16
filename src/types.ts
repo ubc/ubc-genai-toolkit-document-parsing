@@ -52,8 +52,11 @@ export interface EmbeddedImage {
    */
   imageIndex: number;
 
-  /** The original media filename inside the archive (e.g. 'image3.png'). */
-  fileName?: string;
+	/**
+	 * The original media filename inside the archive (e.g. 'image3.png'), or a
+	 * synthetic identifier when contiguous PDF image tiles were stitched.
+	 */
+	fileName?: string;
 }
 
 /**

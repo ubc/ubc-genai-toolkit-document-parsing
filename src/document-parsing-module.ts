@@ -20,7 +20,6 @@ import * as fs from 'fs/promises';
 import { createHash } from 'crypto';
 
 // Import parsing libraries
-import pdf2md from '@opendocsg/pdf2md';
 import mammoth from 'mammoth';
 import TurndownService from 'turndown';
 import markdownToText from 'markdown-to-text';
@@ -50,13 +49,6 @@ const MIN_PDF_IMAGE_DIMENSION = 40;
  */
 const MAX_PDF_IMAGE_DIMENSION = 1500;
 
-/**
- * Marker @opendocsg/pdf2md places between pages in its markdown output. Used
- * to inline each PDF image description on the page it belongs to; always
- * stripped from the final content.
- */
-const PDF2MD_PAGE_BREAK_MARKER = '<!-- PAGE_BREAK -->';
-
 /** Maps common image file extensions found in PPTX archives to MIME types. */
 const IMAGE_EXTENSION_MIME_TYPES: Record<string, string> = {
 	'.png': 'image/png',
@@ -69,6 +61,16 @@ const IMAGE_EXTENSION_MIME_TYPES: Record<string, string> = {
 	'.webp': 'image/webp',
 	'.svg': 'image/svg+xml',
 };
+
+type PdfBoundingBox = [number, number, number, number];
+
+interface PdfImageEntry {
+	image: EmbeddedImage;
+	splitRatio: number;
+	placement: {
+		bbox: PdfBoundingBox;
+	};
+}
 
 // Define default configuration if any specific defaults are needed for this module
 const DEFAULT_DOC_PARSING_CONFIG: Partial<DocumentParsingConfig> = {
@@ -270,13 +272,16 @@ export class DocumentParsingModule {
 	}
 
 	/**
-	 * Parses PDF content. Text is extracted with pdf2md as before; when an
-	 * {@link ImageDescriber} is configured, embedded raster images are also
-	 * extracted (per page, via pdfjs) and their textual descriptions inlined
-	 * as `> [Image, page N] ...` blocks at the end of the page they appear on
-	 * — mirroring how PPTX keeps descriptions with their slide. Image
-	 * extraction failures never fail the overall parse — the text-only result
-	 * is returned instead.
+	 * Parses PDF content with pdfjs. Native text items are reconstructed using
+	 * pdfjs's explicit line-ending metadata instead of font-size/position-based
+	 * Markdown inference, which can split PowerPoint-exported slides into one
+	 * word per line. Each page receives an explicit heading so page boundaries
+	 * survive both Markdown and plain-text output.
+	 *
+	 * When an {@link ImageDescriber} is configured, embedded raster images are
+	 * extracted, adjacent tiles are stitched back into their original visual,
+	 * and descriptions are inlined on the page where they appear. Image
+	 * extraction failures never fail the overall parse.
 	 */
 	private async _parsePdf(
 		filePath: string,
@@ -287,11 +292,10 @@ export class DocumentParsingModule {
 			// Read the file content into a buffer
 			const pdfBuffer = await fs.readFile(filePath);
 
-			// Pass the buffer to pdf2md. Its output joins pages with an HTML
-			// comment marker, which we use to keep image descriptions with their
-			// page (and strip from the final output either way).
-			const rawMarkdown = await pdf2md(pdfBuffer);
-			const pageMarkdowns = rawMarkdown.split(PDF2MD_PAGE_BREAK_MARKER);
+			const pageMarkdowns = await this._extractPdfTextPages(
+				pdfBuffer,
+				filePath
+			);
 
 			const describer = this.config.imageDescriber;
 			if (describer) {
@@ -351,8 +355,12 @@ export class DocumentParsingModule {
 			}
 
 			const markdownContent = pageMarkdowns
-				.map((page) => page.trim())
-				.filter((page) => page.length > 0)
+				.map((page, index) => {
+					const body = page.trim();
+					return body
+						? `## Page ${index + 1}\n\n${body}`
+						: `## Page ${index + 1}`;
+				})
 				.join('\n\n');
 
 			if (outputFormat === 'markdown') {
@@ -365,6 +373,117 @@ export class DocumentParsingModule {
 			this.logger.error('PDF parsing failed', { filePath, error });
 			throw new ParsingError('Failed to parse PDF file', filePath, error);
 		}
+	}
+
+	/** Opens a PDF with the toolkit's pinned pdfjs build. */
+	private async _openPdfDocument(
+		pdfBuffer: Buffer
+	): Promise<{ pdfjs: any; doc: any }> {
+		const dynamicImport = new Function('specifier', 'return import(specifier)');
+		const pdfjs = await dynamicImport('pdfjs-dist/legacy/build/pdf.mjs');
+
+		// A different pdfjs consumer can leave a mismatched worker on this global.
+		// Hide it only while the pinned pdfjs document initializes.
+		const globalScope = globalThis as any;
+		const foreignWorker = globalScope.pdfjsWorker;
+		if (foreignWorker) {
+			delete globalScope.pdfjsWorker;
+		}
+
+		let doc;
+		try {
+			doc = await pdfjs.getDocument({
+				data: new Uint8Array(pdfBuffer),
+				useSystemFonts: true,
+				isEvalSupported: false,
+				verbosity: 0,
+			}).promise;
+		} finally {
+			if (foreignWorker) {
+				globalScope.pdfjsWorker = foreignWorker;
+			}
+		}
+
+		return { pdfjs, doc };
+	}
+
+	/** Extracts one clean Markdown text block per PDF page. */
+	private async _extractPdfTextPages(
+		pdfBuffer: Buffer,
+		filePath: string
+	): Promise<string[]> {
+		const { doc } = await this._openPdfDocument(pdfBuffer);
+		const pages: string[] = [];
+		try {
+			for (let pageNumber = 1; pageNumber <= doc.numPages; pageNumber++) {
+				let page;
+				try {
+					page = await doc.getPage(pageNumber);
+					const textContent = await page.getTextContent();
+					pages.push(this._pdfTextItemsToMarkdown(textContent.items as any[]));
+				} catch (error) {
+					this.logger.warn('Failed to extract PDF page text', {
+						filePath,
+						pageNumber,
+						error,
+					});
+					pages.push('');
+				} finally {
+					page?.cleanup();
+				}
+			}
+		} finally {
+			await doc.destroy();
+		}
+		return pages;
+	}
+
+	/**
+	 * Reconstructs pdfjs text items using their explicit `hasEOL` markers.
+	 * Explicit PDF space glyphs are collapsed to one ordinary space, bullets
+	 * become Markdown list markers, and common Unicode dash glyphs are
+	 * normalized so searchable words such as "Watson-Crick" stay intact.
+	 */
+	private _pdfTextItemsToMarkdown(items: any[]): string {
+		const lines: string[] = [];
+		let current = '';
+		let pendingSpace = false;
+
+		const flush = (): void => {
+			let line = current.replace(/\s+/g, ' ').trim();
+			// U+2010/U+2011 are word-joining hyphens. En/em dashes are
+			// separators and must retain surrounding spaces.
+			line = line.replace(/\s*[\u2010\u2011]\s*/g, '-');
+			line = line.replace(/\s*[\u2012-\u2015]\s*/g, ' - ');
+			line = line.replace(/\u2212/g, '-');
+			line = line.replace(/^[\u2022\u2023\u25E6\u2043\u2219]\s*/, '- ');
+			if (line) {
+				lines.push(line);
+			}
+			current = '';
+			pendingSpace = false;
+		};
+
+		for (const item of items) {
+			const raw = typeof item?.str === 'string' ? item.str : '';
+			if (raw.trim()) {
+				const text = raw.replace(/\s+/g, ' ').trim();
+				if (current && pendingSpace) {
+					current += ' ';
+				}
+				current += text;
+				pendingSpace = false;
+			} else if (raw.length > 0) {
+				pendingSpace = true;
+			}
+
+			if (item?.hasEOL) {
+				flush();
+			}
+		}
+		flush();
+
+		return lines.join('\n');
 	}
 
 	/**
@@ -446,51 +565,22 @@ export class DocumentParsingModule {
 	 * sits vertically within its page's text (0 = above all text, 1 = below all
 	 * text), computed from the fraction of the page's characters that lie above
 	 * the image. This lets the caller inline the description at the right point
-	 * in reading order rather than dumping it at the end of the page. pdf2md
-	 * discards positions, so the ratio is necessarily approximate and snapped to
-	 * a paragraph boundary; it defaults to 1 (append) when text geometry is
-	 * unavailable.
+	 * in reading order rather than dumping it at the end of the page. The ratio
+	 * is necessarily approximate and snapped to a paragraph boundary; it
+	 * defaults to 1 (append) when text geometry is unavailable.
 	 */
 	private async _extractPdfImages(
 		pdfBuffer: Buffer,
 		filePath: string
-	): Promise<Array<{ image: EmbeddedImage; splitRatio: number }>> {
-		// pdfjs-dist v4 is ESM-only; dynamic-import it the same way as file-type
-		// (via Function constructor to survive the tsc CommonJS transform).
-		const dynamicImport = new Function('specifier', 'return import(specifier)');
-		const pdfjs = await dynamicImport('pdfjs-dist/legacy/build/pdf.mjs');
-
-		// pdf2md (via its `unpdf` dependency) bundles a DIFFERENT pdfjs version
-		// and leaves its worker on `globalThis.pdfjsWorker`, which pdfjs checks
-		// BEFORE loading its own matching worker — producing an API/Worker
-		// version-mismatch error. Hide any foreign global worker while our
-		// document initialises (pdfjs caches its own worker after first use).
-		const globalScope = globalThis as any;
-		const foreignWorker = globalScope.pdfjsWorker;
-		if (foreignWorker) {
-			delete globalScope.pdfjsWorker;
-		}
-
-		let doc;
-		try {
-			doc = await pdfjs.getDocument({
-				data: new Uint8Array(pdfBuffer),
-				useSystemFonts: true,
-				isEvalSupported: false,
-				verbosity: 0,
-			}).promise;
-		} finally {
-			if (foreignWorker) {
-				globalScope.pdfjsWorker = foreignWorker;
-			}
-		}
-
-		const results: Array<{ image: EmbeddedImage; splitRatio: number }> = [];
+	): Promise<PdfImageEntry[]> {
+		const { pdfjs, doc } = await this._openPdfDocument(pdfBuffer);
+		const results: PdfImageEntry[] = [];
 		try {
 			for (let pageNumber = 1; pageNumber <= doc.numPages; pageNumber++) {
 				let page;
 				try {
 					page = await doc.getPage(pageNumber);
+					const viewport = page.getViewport({ scale: 1 });
 					const opList = await page.getOperatorList();
 
 					// Collect the ids of image XObjects painted on this page, in
@@ -500,6 +590,7 @@ export class DocumentParsingModule {
 					const seenIds = new Set<string>();
 					const orderedIds: string[] = [];
 					const centerYById = new Map<string, number>();
+					const bboxById = new Map<string, PdfBoundingBox>();
 					let ctm = [1, 0, 0, 1, 0, 0];
 					const ctmStack: number[][] = [];
 					for (let i = 0; i < opList.fnArray.length; i++) {
@@ -515,17 +606,34 @@ export class DocumentParsingModule {
 							if (typeof objId === 'string' && !seenIds.has(objId)) {
 								seenIds.add(objId);
 								orderedIds.push(objId);
-								// Image unit square maps y=0 -> ctm[5], y=1 -> ctm[5]+ctm[3].
-								const yA = ctm[5];
-								const yB = ctm[5] + ctm[3];
-								centerYById.set(objId, (yA + yB) / 2);
+								const displayCtm = pdfjs.Util.transform(
+									viewport.transform,
+									ctm
+								);
+								const corners = [
+									[0, 0],
+									[1, 0],
+									[0, 1],
+									[1, 1],
+								].map(([x, y]) => [
+									displayCtm[0] * x + displayCtm[2] * y + displayCtm[4],
+									displayCtm[1] * x + displayCtm[3] * y + displayCtm[5],
+								]);
+								const bbox: PdfBoundingBox = [
+									Math.min(...corners.map((point) => point[0])),
+									Math.min(...corners.map((point) => point[1])),
+									Math.max(...corners.map((point) => point[0])),
+									Math.max(...corners.map((point) => point[1])),
+								];
+								bboxById.set(objId, bbox);
+								centerYById.set(objId, (bbox[1] + bbox[3]) / 2);
 							}
 						}
 					}
 
-					// Page text geometry: total characters and a helper that sums
-					// the characters lying above a given y (higher y == higher on
-					// the page in PDF user space).
+					// Page text geometry in viewport coordinates: total characters
+					// and a helper that sums the characters above a given y (smaller
+					// y values are closer to the top of the rendered page).
 					let textItems: Array<{ y: number; len: number }> = [];
 					let totalChars = 0;
 					try {
@@ -535,7 +643,11 @@ export class DocumentParsingModule {
 							if (!str) {
 								continue;
 							}
-							textItems.push({ y: item.transform[5], len: str.length });
+							const displayTransform = pdfjs.Util.transform(
+								viewport.transform,
+								item.transform
+							);
+							textItems.push({ y: displayTransform[5], len: str.length });
 							totalChars += str.length;
 						}
 					} catch (error) {
@@ -553,13 +665,14 @@ export class DocumentParsingModule {
 						}
 						let charsAbove = 0;
 						for (const item of textItems) {
-							if (item.y >= centerY) {
+							if (item.y <= centerY) {
 								charsAbove += item.len;
 							}
 						}
 						return charsAbove / totalChars;
 					};
 
+					const pageResults: PdfImageEntry[] = [];
 					let imageIndex = 0;
 					for (const objId of orderedIds) {
 						try {
@@ -569,7 +682,11 @@ export class DocumentParsingModule {
 								continue; // Tiny/undecodable image.
 							}
 							const centerY = centerYById.get(objId);
-							results.push({
+							const bbox = bboxById.get(objId);
+							if (!bbox) {
+								continue;
+							}
+							pageResults.push({
 								image: {
 									data: png,
 									mimeType: 'image/png',
@@ -582,6 +699,7 @@ export class DocumentParsingModule {
 									centerY === undefined
 										? 1
 										: splitRatioForCenter(centerY),
+								placement: { bbox },
 							});
 						} catch (error) {
 							this.logger.warn(
@@ -590,6 +708,12 @@ export class DocumentParsingModule {
 							);
 						}
 					}
+
+					const mergedPageResults = this._mergePdfImageTiles(pageResults);
+					mergedPageResults.forEach((entry, index) => {
+						entry.image.imageIndex = index;
+					});
+					results.push(...mergedPageResults);
 				} finally {
 					page?.cleanup();
 				}
@@ -598,6 +722,161 @@ export class DocumentParsingModule {
 			await doc.destroy();
 		}
 		return results;
+	}
+
+	/**
+	 * Reassembles images that a PDF encoder split into contiguous horizontal or
+	 * vertical tiles. A merge is deliberately conservative: tiles must be very
+	 * wide (or very tall), share the same long-axis placement, and touch along
+	 * their short axis. Ordinary adjacent figures therefore remain separate.
+	 */
+	private _mergePdfImageTiles(entries: PdfImageEntry[]): PdfImageEntry[] {
+		if (entries.length < 2) {
+			return entries;
+		}
+
+		const output: PdfImageEntry[] = [];
+		let group: PdfImageEntry[] = [entries[0]];
+		const flush = (): void => {
+			if (group.length > 1) {
+				const stitched = this._stitchPdfImageTiles(group);
+				output.push(stitched);
+				this.logger.debug('Stitched contiguous PDF image tiles', {
+					pageNumber: stitched.image.pageNumber,
+					tileCount: group.length,
+					fileNames: group.map((entry) => entry.image.fileName),
+				});
+			} else {
+				output.push(group[0]);
+			}
+		};
+
+		for (let index = 1; index < entries.length; index++) {
+			const entry = entries[index];
+			if (this._pdfImageTilesAreContiguous(group[group.length - 1], entry)) {
+				group.push(entry);
+			} else {
+				flush();
+				group = [entry];
+			}
+		}
+		flush();
+
+		return output;
+	}
+
+	/** Whether two raster placements are aligned, touching slices. */
+	private _pdfImageTilesAreContiguous(
+		first: PdfImageEntry,
+		second: PdfImageEntry
+	): boolean {
+		let firstPng;
+		let secondPng;
+		try {
+			firstPng = PNG.sync.read(first.image.data);
+			secondPng = PNG.sync.read(second.image.data);
+		} catch {
+			return false;
+		}
+
+		const firstWide = firstPng.width / firstPng.height >= 4;
+		const secondWide = secondPng.width / secondPng.height >= 4;
+		const firstTall = firstPng.height / firstPng.width >= 4;
+		const secondTall = secondPng.height / secondPng.width >= 4;
+		const [aLeft, aTop, aRight, aBottom] = first.placement.bbox;
+		const [bLeft, bTop, bRight, bBottom] = second.placement.bbox;
+		const longSpan = Math.max(
+			aRight - aLeft,
+			aBottom - aTop,
+			bRight - bLeft,
+			bBottom - bTop
+		);
+		const tolerance = Math.max(1, longSpan * 0.01);
+		const close = (a: number, b: number): boolean =>
+			Math.abs(a - b) <= tolerance;
+
+		if (firstWide && secondWide) {
+			const sameHorizontalSpan = close(aLeft, bLeft) && close(aRight, bRight);
+			const verticalEdgesTouch = close(aBottom, bTop) || close(bBottom, aTop);
+			const samePixelWidth =
+				Math.abs(firstPng.width - secondPng.width) /
+					Math.max(firstPng.width, secondPng.width) <=
+				0.02;
+			return sameHorizontalSpan && verticalEdgesTouch && samePixelWidth;
+		}
+
+		if (firstTall && secondTall) {
+			const sameVerticalSpan = close(aTop, bTop) && close(aBottom, bBottom);
+			const horizontalEdgesTouch = close(aRight, bLeft) || close(bRight, aLeft);
+			const samePixelHeight =
+				Math.abs(firstPng.height - secondPng.height) /
+					Math.max(firstPng.height, secondPng.height) <=
+				0.02;
+			return sameVerticalSpan && horizontalEdgesTouch && samePixelHeight;
+		}
+
+		return false;
+	}
+
+	/** Combines a validated tile group into one PNG and one PDF image entry. */
+	private _stitchPdfImageTiles(group: PdfImageEntry[]): PdfImageEntry {
+		const decoded = group.map((entry) => ({
+			entry,
+			png: PNG.sync.read(entry.image.data),
+		}));
+		const vertical = decoded[0].png.width / decoded[0].png.height >= 4;
+		decoded.sort((a, b) =>
+			vertical
+				? a.entry.placement.bbox[1] - b.entry.placement.bbox[1]
+				: a.entry.placement.bbox[0] - b.entry.placement.bbox[0]
+		);
+
+		const width = vertical
+			? Math.max(...decoded.map(({ png }) => png.width))
+			: decoded.reduce((sum, { png }) => sum + png.width, 0);
+		const height = vertical
+			? decoded.reduce((sum, { png }) => sum + png.height, 0)
+			: Math.max(...decoded.map(({ png }) => png.height));
+		const stitched = new PNG({ width, height });
+		let offsetX = 0;
+		let offsetY = 0;
+		for (const { png } of decoded) {
+			for (let row = 0; row < png.height; row++) {
+				const sourceStart = row * png.width * 4;
+				const destinationStart =
+					((offsetY + row) * width + offsetX) * 4;
+				png.data.copy(
+					stitched.data,
+					destinationStart,
+					sourceStart,
+					sourceStart + png.width * 4
+				);
+			}
+			if (vertical) {
+				offsetY += png.height;
+			} else {
+				offsetX += png.width;
+			}
+		}
+
+		const left = Math.min(...group.map((entry) => entry.placement.bbox[0]));
+		const top = Math.min(...group.map((entry) => entry.placement.bbox[1]));
+		const right = Math.max(...group.map((entry) => entry.placement.bbox[2]));
+		const bottom = Math.max(...group.map((entry) => entry.placement.bbox[3]));
+		const representative = decoded[0].entry;
+		return {
+			image: {
+				...representative.image,
+				data: PNG.sync.write(stitched),
+				fileName: `stitched:${decoded
+					.map(({ entry }) => entry.image.fileName || entry.image.imageIndex)
+					.join('+')}`,
+			},
+			splitRatio:
+				group.reduce((sum, entry) => sum + entry.splitRatio, 0) /
+				group.length,
+			placement: { bbox: [left, top, right, bottom] },
+		};
 	}
 
 	/**
@@ -618,18 +897,55 @@ export class DocumentParsingModule {
 	}
 
 	/**
-	 * Resolves a pdfjs object id to its decoded image object, checking the
-	 * page-local store first and falling back to the document-common store.
+	 * Resolves a pdfjs object id to its decoded image object. PDF.js stores
+	 * page-local images in `page.objs`, but promotes image resources reused on
+	 * multiple pages into `page.commonObjs`. The callback form of `get` does not
+	 * throw when an id belongs to the other store; it waits indefinitely. Listen
+	 * to both stores and accept whichever resolves first instead.
 	 */
 	private _resolvePdfObject(page: any, objId: string): Promise<any> {
+		const OBJECT_RESOLUTION_TIMEOUT_MS = 5000;
+
 		return new Promise((resolve, reject) => {
-			try {
-				page.objs.get(objId, (obj: any) => resolve(obj));
-			} catch {
+			let settled = false;
+			let failedStores = 0;
+			let lastError: unknown;
+
+			const timeoutId = setTimeout(() => {
+				if (settled) {
+					return;
+				}
+				settled = true;
+				reject(
+					new Error(`PDF image object did not resolve: ${objId}`)
+				);
+			}, OBJECT_RESOLUTION_TIMEOUT_MS);
+
+			const finish = (obj: any): void => {
+				if (settled) {
+					return;
+				}
+				settled = true;
+				clearTimeout(timeoutId);
+				resolve(obj);
+			};
+
+			const failStore = (error: unknown): void => {
+				failedStores++;
+				lastError = error;
+				if (failedStores < 2 || settled) {
+					return;
+				}
+				settled = true;
+				clearTimeout(timeoutId);
+				reject(lastError);
+			};
+
+			for (const store of [page.objs, page.commonObjs]) {
 				try {
-					page.commonObjs.get(objId, (obj: any) => resolve(obj));
+					store.get(objId, finish);
 				} catch (error) {
-					reject(error);
+					failStore(error);
 				}
 			}
 		});
