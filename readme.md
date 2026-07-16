@@ -77,6 +77,15 @@ async function parseDocument(filePath: string) {
 
 This example initializes the module and uses it to parse a file into both Markdown and plain text, printing the first 200 characters of each result.
 
+## PDF (`.pdf`)
+
+PDF text is reconstructed from PDF.js text items and explicit line endings.
+Output is grouped under `## Page N` headings so page boundaries survive in
+both Markdown and plain text. When `imageDescriber` is configured, embedded
+raster images are decoded and described on their source page. Contiguous image
+tiles produced by PDF exporters are stitched back into one visual before the
+description hook is called.
+
 ## PowerPoint (`.pptx`)
 
 PowerPoint files are parsed entirely in pure JavaScript (no LibreOffice or other
@@ -87,12 +96,12 @@ system dependency). For each slide, in presentation order, the module extracts:
 -   and — when an `imageDescriber` is configured — a text description of each
     embedded image.
 
-### Parsing images (PowerPoint)
+### Parsing images (PowerPoint, PDF and Word)
 
 The module never calls an LLM or holds an API key. Instead it exposes an optional
 `imageDescriber` hook. When provided, each embedded image is handed to your
-function and the returned text is inlined under its slide. When omitted, parsing
-is text-only and makes no external calls.
+function and the returned text is inlined under its slide, page or document
+position. When omitted, parsing is text-only and makes no external calls.
 
 ```typescript
 import { DocumentParsingModule, EmbeddedImage } from 'ubc-genai-toolkit-document-parsing';

@@ -37,7 +37,10 @@ export interface EmbeddedImage {
      * or within the whole document (DOCX), in document order.
      */
     imageIndex: number;
-    /** The original media filename inside the archive (e.g. 'image3.png'). */
+    /**
+     * The original media filename inside the archive (e.g. 'image3.png'), or a
+     * synthetic identifier when contiguous PDF image tiles were stitched.
+     */
     fileName?: string;
 }
 /**

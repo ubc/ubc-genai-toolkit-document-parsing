@@ -32,15 +32,29 @@ export declare class DocumentParsingModule {
      */
     private _detectFileType;
     /**
-     * Parses PDF content. Text is extracted with pdf2md as before; when an
-     * {@link ImageDescriber} is configured, embedded raster images are also
-     * extracted (per page, via pdfjs) and their textual descriptions inlined
-     * as `> [Image, page N] ...` blocks at the end of the page they appear on
-     * — mirroring how PPTX keeps descriptions with their slide. Image
-     * extraction failures never fail the overall parse — the text-only result
-     * is returned instead.
+     * Parses PDF content with pdfjs. Native text items are reconstructed using
+     * pdfjs's explicit line-ending metadata instead of font-size/position-based
+     * Markdown inference, which can split PowerPoint-exported slides into one
+     * word per line. Each page receives an explicit heading so page boundaries
+     * survive both Markdown and plain-text output.
+     *
+     * When an {@link ImageDescriber} is configured, embedded raster images are
+     * extracted, adjacent tiles are stitched back into their original visual,
+     * and descriptions are inlined on the page where they appear. Image
+     * extraction failures never fail the overall parse.
      */
     private _parsePdf;
+    /** Opens a PDF with the toolkit's pinned pdfjs build. */
+    private _openPdfDocument;
+    /** Extracts one clean Markdown text block per PDF page. */
+    private _extractPdfTextPages;
+    /**
+     * Reconstructs pdfjs text items using their explicit `hasEOL` markers.
+     * Explicit PDF space glyphs are collapsed to one ordinary space, bullets
+     * become Markdown list markers, and common Unicode dash glyphs are
+     * normalized so searchable words such as "Watson-Crick" stay intact.
+     */
+    private _pdfTextItemsToMarkdown;
     /**
      * Inserts image-description blocks into a page's markdown at the vertical
      * position each image occupies, expressed as a `ratio` in [0, 1] of the
@@ -60,12 +74,22 @@ export declare class DocumentParsingModule {
      * sits vertically within its page's text (0 = above all text, 1 = below all
      * text), computed from the fraction of the page's characters that lie above
      * the image. This lets the caller inline the description at the right point
-     * in reading order rather than dumping it at the end of the page. pdf2md
-     * discards positions, so the ratio is necessarily approximate and snapped to
-     * a paragraph boundary; it defaults to 1 (append) when text geometry is
-     * unavailable.
+     * in reading order rather than dumping it at the end of the page. The ratio
+     * is necessarily approximate and snapped to a paragraph boundary; it
+     * defaults to 1 (append) when text geometry is unavailable.
      */
     private _extractPdfImages;
+    /**
+     * Reassembles images that a PDF encoder split into contiguous horizontal or
+     * vertical tiles. A merge is deliberately conservative: tiles must be very
+     * wide (or very tall), share the same long-axis placement, and touch along
+     * their short axis. Ordinary adjacent figures therefore remain separate.
+     */
+    private _mergePdfImageTiles;
+    /** Whether two raster placements are aligned, touching slices. */
+    private _pdfImageTilesAreContiguous;
+    /** Combines a validated tile group into one PNG and one PDF image entry. */
+    private _stitchPdfImageTiles;
     /**
      * Multiplies the current transformation matrix by a pdfjs `transform`
      * operator's matrix (both in [a, b, c, d, e, f] form), returning the new
@@ -73,8 +97,11 @@ export declare class DocumentParsingModule {
      */
     private _multiplyMatrix;
     /**
-     * Resolves a pdfjs object id to its decoded image object, checking the
-     * page-local store first and falling back to the document-common store.
+     * Resolves a pdfjs object id to its decoded image object. PDF.js stores
+     * page-local images in `page.objs`, but promotes image resources reused on
+     * multiple pages into `page.commonObjs`. The callback form of `get` does not
+     * throw when an id belongs to the other store; it waits indefinitely. Listen
+     * to both stores and accept whichever resolves first instead.
      */
     private _resolvePdfObject;
     /**
